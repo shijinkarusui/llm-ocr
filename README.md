@@ -1,289 +1,347 @@
 # llm-ocr
 
-> 位置：本仓库根目录
-> 状态：已实现（2026-09-03 实测双链路 200 + 同日灵活化改造已落地，方案 C 三协议统一，`task_plan.md` 为执行主规划）
-> 测试书：本地扫描版《语音学教程》（300+ 页，旧文字层乱码，测试时丢弃，未随仓库发布）
+> Vision-LLM OCR toolchain for scanned Chinese phonetics textbooks: per-page
+> Markdown transcription (IPA-safe) + raster-backed searchable dual-layer PDF,
+> driven by any OpenAI-compatible gateway. Desktop GUI (Tkinter, stdlib-only)
+> and CLI share one engine. API key lives in memory/env only — never in git.
+
+English overview first; full Chinese manual below (Chapters 1-9).
 
 ---
 
-## 1. 任务目标
+## 0. What it is
 
-建一个独立文件夹工程，实现：
+- **Input**: scanned images / scanned PDF (each page rasterized to PNG).
+- **Output A**: high-fidelity Markdown — whole book `book.md` + per-page
+  `pages/page_*.md` (Chinese punctuation normalized, IPA kept verbatim,
+  positional附标 emitted as LaTeX inline math).
+- **Output B**: dual-layer searchable PDF `book_searchable.pdf` — original
+  raster as background (same page size), plus an invisible searchable text
+  layer. The old garbled text layer is never reused.
+- **Model**: any OpenAI-compatible `POST /v1/*` gateway —
+  `chat/completions`, `responses`, `messages` all supported, arbitrary
+  official fields pass straight through (`**kwargs` / `--extra-json`).
+- **Key hygiene**: `LLM_OCR_KEY` (also `LLM_OCR_API_KEY`/`OCTOPUS_API_KEY`),
+  `.env` autoload, `Key never in git` (`.gitignore` enforces it).
 
-1. **输入**：扫描图像 / 扫描PDF（按页渲染为PNG）。
-2. **输出A**：高精度Markdown（全书 `book.md` + 逐页 `out/pages/page_*.md`）。
-   - 中文标点规范，段落标题保留，页脚 `· n ·` 单独成行。
-   - IPA原样保留：`ɕ ŋ ə ɛ ɔ ɑ β ʔ ʂ tɕ tʂ ʰ ː ˈ ³⁵`等。
-   - 附标位置语法100%正确，见第4章。
-3. **输出B**：双层可搜索PDF `book_searchable.pdf`。
-   - 原页光栅做背景（尺寸不变），新加不可见可搜索文字层。
-   - 可复制、可检索、可定位到页。旧乱码层绝不复用。
-4. **模型**：用户接口 `http://YOUR_GATEWAY_HOST:2113/v1` / `MODEL=OC/muse-spark-1.3-contributor-free` / `KEY` 走环境变量 `LLM_OCR_KEY`（兼容 `LLM_OCR_API_KEY`/`OCTOPUS_API_KEY`，不硬编码），**最终交付必须可自定义 URL**：`LLM_OCR_BASE_URL` / `--base-url` 覆盖默认，`LLM_OCR_MODEL` / `--model` 同理，`_resolve_endpoint()` 自动防 `/v1/v1` 双写，默认 `OC/` 前缀必须保留（裸名会 400）。
-5. **灵活调用（新增）**：不再把 `max_tokens=100000 / temperature=0` 写死；任意官方 OpenAI / Responses / Anthropic 字段通过 `**kwargs` / `--extra-json` 直通网关，三条入站 `chat / responses / messages` 全开放（见第3章）。
-6. **禁令**：全流程只允许“原PDF光栅 + LLM输出”，禁止读 `mineru-results`，禁止提MinerU。
-
-已验证结论（2026-09-03 实测，不重测）：
-
-- `POST /v1/chat/completions` 与 `POST /v1/responses` 均 `200`（`cand_165.png` 113KB, b64 151952：chat 19.1s in474/out1616，responses 7.3s in474/out615，证物 `out/probe_ocr_chat.json` / `out/probe_ocr_responses.json`），`GET/POST /v1/files` -> `404` 未实现，无需使用。
-- 三条链路和官网 openai/anthropic 完全一致：`data:image/png;base64,...` 本地先 base64 体感直传 + `https://...` 远端免 base64 均支持，`detail: high|low|auto` 可选（IPA 推荐 high）。
-- `responses` 的 `input` 必须包 `[{role:user, content:[input_text, input_image]}]`，顶层平铺会 400 `input[0] did not match any supported type`。
-- page21（150dpi）约3356~4555 tokens；IPA重页cand166（原书146页）6处 `underset`、零`[t_w]`。
-- 推荐DPI=200（IPA页1184x1788，b64约1.13MB<1.5MB，300dpi约2.4MB超限）。
-- 303页估算约200万tokens。
-- 旧层175/303页可疑，`strip_check=must_discard`。
-- boxes“部分可用”（33行，中心误差<13px，标题差字，不能直写精确覆盖，要fallback）。
-- 双层样例3页背景`maxdiff=0`，顺/逆同化各命中4次（fallback双副本导致重复，预期内）。
-
----
-
-## 2. 实现流程
+## 1. Architecture
 
 ```
-原PDF --render.py(200dpi)--> PNG
-  --> llm_client.chat_vision(PNG, ocr_system.md)          // chat: image_url
-      |_ llm_client.responses_vision(PNG, ...)           // responses: input_image
-      |_ llm_client.anthropic_vision(PNG, ...)           // messages: base64
-      |_ chat_vision_url / responses_vision_url / anthropic_vision_url (https 免 base64)
-      +-- **kwargs / --extra-json 全透传 --> 页MD
-  --> check_notation.py门禁 --> out/pages/
-  --> postprocess.clean_md + merge_pages --> book.md
-  --> make_searchable(背景PNG + MD [+boxes]) --> book_searchable.pdf
-  --> verify_searchable(get_text关键词) --> 验证报告
+                          +-------------------+
+                          |   prompts/*.md    |  OCR contract
+                          | ocr_system.md     |  (transcription rules,
+                          | notation_spec.md  |   6-position LaTeX map)
+                          +----+------+-------+
+                               |      |
+              +----------------+      +-----------------+
+              |                                       |
+     +--------v--------+                   +----------v--------+
+     |  DESKTOP GUI    |  shared State     |       CLI         |
+     |  app_gui.py     |<----------------->|  src/cli.py       |
+     |  (Tkinter,      |  base_url/model/  |  models/probe/    |
+     |   stdlib only)  |  key/endpoint/    |  ocr/batch/       |
+     |                 |  detail/dpi/...   |  config/--tui     |
+     | 5 tabs: connect |                   |                   |
+     | single / batch /|                   |  thin dispatch:   |
+     | searchable /    |                   |  cli.py -> per-   |
+     | params + bottom |                   |  module mains,    |
+     | log console     |                   |  one resolve path |
+     +--------+--------+                   +----------+--------+
+              |                                       |
+              +-------------------+-------------------+
+                                  |
+                    +-------------v--------------+
+                    |      CORE ENGINE (src/)    |
+                    |                            |
+                    | config.py  GlobalConfig{   |
+                    |  base_url,model,key,       |
+                    |  timeout} vs RunConfig{    |
+                    |  endpoint,detail,          |
+                    |  concurrency,dpi,retries,  |
+                    |  system,extra}             |
+                    |  Priority: CLI > env >     |
+                    |  DEFAULT; key in memory    |
+                    |  only, write_env() never   |
+                    |  persists plaintext        |
+                    |                            |
+                    | llm_client.py  TRANSPORT:  |
+                    |  generic_request(endpoint, |
+                    |  body) low-level + typed   |
+                    |  chat_completions /        |
+                    |  responses_create /        |
+                    |  anthropic_messages +      |
+                    |  *_vision (+_url) helpers; |
+                    |  auto_vision() 1+1 route;  |
+                    |  HttpError fail-fast 4xx,  |
+                    |  retry 429/5xx/timeout;    |
+                    |  _resolve_endpoint() anti  |
+                    |  /v1/v1 double-write       |
+                    +-------------+--------------+
+                                  |
+            +---------------------+----------------------+
+            |                     |                      |
+ +----------v---------+ +---------v--------+ +-----------v---------+
+ | ocr_page.py        | | batch_plan.py    | | make_searchable.py  |
+ | SINGLE PAGE:       | | BATCH:           | | DUAL-LAYER PDF:     |
+ | image / pdf-page / | | ThreadPool 1-20, | | raster = background |
+ | image-url -> PNG   | | adaptive halve/  | | (same size), text   |
+ | -> *_vision()      | | recover, dry-run | | layer invisible;    |
+ | -> page MD         | | plan, usage.jsonl| | boxes reliable ->   |
+ |                    | | append (resume), | | render_mode=3 exact |
+ +----------+---------+ | skipped logged   | | else fallback dual  |
+            |           +---------+--------+ | copy (full-hidden   |
+            |                     |          | + per-line spread)   |
+ +----------v---------+ +---------v--------+ +-----------v---------+
+ | check_notation.py  | | postprocess.py   | | verify_searchable.py|
+ | GATE: banned       | | clean_md (CJK    | | VERIFY: per-page    |
+ | [t_w]/lost marks/  | | punct, footers,  | | keyword hits,       |
+ | unpaired $/{}      | | protect math) +  | | copyable chars,     |
+ | -> 0 issues gate   | | merge_pages +    | | compare_md diff     |
+ |                    | | polish_with_llm  | |                     |
+ +----------+---------+ +---------+--------+ +-----------+---------+
+            |                     |                      |
+            +---------------------+----------------------+
+                                  |
+                    +-------------v--------------+
+                    | render.py (PyMuPDF/fitz) |
+                    | render_page(pdf,pno,dpi) |
+                    | -> opaque PNG bytes      |
+                    +--------------------------+
 ```
 
-1. **渲染**：`src/render.py: render_page(pdf,pno,dpi=200)->bytes`。新PDF以PNG为全页背景，原尺寸建页。
-2. **OCR**：`src/llm_client.py + src/ocr_page.py`。`batch_plan.py`驱动批量，`out/pages/page_{pno:04d}.md + out/usage.jsonl`断点续跑，串行，失败重试2次。`llm_client` 支持 `LLM_OCR_BASE_URL/MODEL/KEY` 与 `--base-url/--model/--api-key` 双轨，三协议 `chat|responses|messages` 可切，`detail high|low|auto` 可调，`--extra-json` 任意字段直通（见3.3~3.4）。
-3. **标号门禁**：`prompts/ocr_system.md + prompts/notation_spec.md`约束，`src/check_notation.py`拦截。
-4. **定位**：boxes可靠时`render_mode=3`按盒写入；否则fallback“全文隐藏副本+按行均匀分布”，保证可搜可复制。
-5. **合并**：`src/postprocess.py: clean_md + merge_pages`，页间`<!-- PAGE n -->`，头部索引。`polish_with_llm` 同样三协议活透传。
-6. **验证**：`src/verify_searchable.py: verify + compare_md`，查顺同化/逆同化/语音学命中页与可复制字数。
+### Layer responsibilities
 
-目录：
-
-```
-llm-ocr/
-  prompts/ocr_system.md  notation_spec.md
-  src/llm_client.py          # 三协议活透传核心：generic_request + chat/responses/messages
-      ocr_page.py            # 单页OCR：--endpoint/--detail/--extra-json
-      render.py  batch_plan.py  # 批量：同款活参，usage.jsonl 追加 endpoint/extra
-      make_searchable.py  check_notation.py  postprocess.py  verify_searchable.py
-  out/pages/  usage.jsonl  book.md  book_searchable.pdf
-  tests/page21_150.png  cand_165/166/167.png  notation_cases.json
-  .env.example  task_plan.md  README.md
-```
-
----
-
-## 3. LLM调用规范（灵活化后，覆盖旧死参写法 2026-09-03）
-
-> 溯源：`bestruirui/octopus internal/server/handlers/relay.go:14` -> `router.NewGroupRouter("/v1").AddRoute("/chat/completions", Forward(APIFormatOpenAIChatCompletion)).AddRoute("/responses", Forward(APIFormatOpenAIResponse)).AddRoute("/messages", Forward(APIFormatAnthropicMessage))` + `looplj/axonhub llm/model.go + transformer/openai/{model.go, responses/model.go} + transformer/anthropic/model.go`
->
-> **网关真相**：`internal/relay/handler.go:Forward()` 只读 `model`+`stream` 做选组与路由，**业务参数完全不校验直接 `raw.Body` 透传**；同协议 `sendPassthrough` 原样转发，跨协议走 `axonhub/llm/transformer` 自动转换。结论：**只要是官方合法 JSON，Octopus 都会原样发给上游**（仅禁止覆盖 `model`/`stream`，其余 `ParamOverride` 都能透传）。
-
-### 3.1 三入站（Octopus 全开）
-
-| 入站 | 路径 | 源码模型 | 用途 |
+| Layer | Files | Owns | Never touches |
 |---|---|---|---|
-| Chat Completions | `POST /v1/chat/completions` | `axonhub llm/transformer/openai/model.go:Request` | OpenAI 兼容，最常用，OCR 默认 |
-| Responses | `POST /v1/responses` | `axonhub llm/transformer/openai/responses/model.go:Request` | OpenAI Responses，推理省 token（实测 7.3s vs 19.1s） |
-| Messages | `POST /v1/messages` | `axonhub llm/transformer/anthropic/model.go:MessageRequest` | Anthropic 兼容，第3条路由一直可用 |
+| Contract | `prompts/ocr_system.md`, `prompts/notation_spec.md` | Transcription rules, 6-position附标→LaTeX map, IPA keep-list | Code, keys |
+| Config | `src/config.py` + `.env.example` | `GlobalConfig` vs `RunConfig`, CLI>env>DEFAULT, dotenv first-import, key masking | Transport, rendering |
+| Transport | `src/llm_client.py` | 3 ingresses, passthrough `**kwargs`, `auto_vision()` 1+1, retries, endpoint normalize | OCR prompts, PDF layout |
+| Page/Batch | `src/ocr_page.py`, `src/batch_plan.py` | Single shot, thread pool + adaptive concurrency, `usage.jsonl` resume | Gateway internals |
+| Render/Search | `src/render.py`, `src/make_searchable.py` | 200dpi raster, raster-bg + hidden text, box/exact vs fallback | LLM params |
+| Quality | `src/check_notation.py`, `src/postprocess.py`, `src/verify_searchable.py` | Notation gate, CJK cleanup + merge, keyword/copyable verify | Secrets |
+| GUI | `app_gui.py`, `gui/*` (stdlib only) | 5 tabs, shared `State`, `Runner` bg threads, `LogBus`, Per-Monitor V2 DPI auto-adapt | Engine logic |
+| CLI | `src/cli.py`, `src/cli_common.py`, `src/interactive.py` | One flag source (`add_llm_args`), subcommands, TUI shim | GUI widgets |
 
-`GET/POST /v1/files` 在 OCT 上 `404` 未实现，无需也无法走 `file_id`；生图是另一条 `tools:[{type:image_generation}]` 别混。
+### Data flow (one page)
 
-### 3.2 完整参数面（均可透传，不再写死）
-
-**Chat** 必选 `model`, `messages`；关键可选：`temperature/top_p/seed/frequency_penalty/presence_penalty/logit_bias/logprobs/top_logprobs`, `max_tokens`(deprecated)/`max_completion_tokens`, `reasoning_effort(none/minimal/low/medium/high/xhigh/max)/reasoning_budget/reasoning_summary`, `tools/tool_choice/parallel_tool_calls`, `response_format{type, json_schema}/verbosity/stop/stream+stream_options{include_usage}`, `store/service_tier/metadata/modalities`, `thinking{type:enabled/disabled}`, `extra_body`。视觉：`messages[].content: [{type:text},{type:image_url, image_url:{url: data:...|https://..., detail: high|low|auto}}]`。
-
-**Responses** 必选 `model`, `input`；关键可选：`instructions`(→system), `input: string | [{type:message/function_call/reasoning, role, content:[{type:input_text/input_image, image_url, detail}]}]`（**必须包在 message 内**，顶层平铺会 400），`max_output_tokens`, `reasoning{effort, summary, max_tokens}`, `text{format{type:text/json_object/json_schema, schema, strict}, verbosity}`, `tools[{type:function/image_generation/web_search/custom/namespace}]`, `truncation/include/background/previous_response_id/stream`。
-
-**Messages** 必选 `model`, `messages`, `max_tokens`；关键可选：`system: string|[{type:text}]`, `temperature(0-1)/top_k/top_p`, `thinking{type:enabled/disabled/adaptive, budget_tokens, display}`, `output_config{effort:low/medium/high/max}`, `tools/tool_choice`, `stop_sequences/cache_control`。视觉：`content: [{type:text},{type:image, source:{type:base64|url, media_type:image/png|jpeg|gif|webp, data|url}}]`。
-
-跨协议自动转：`channel.go:buildOutbound()` 优先级 `want > Anthropic > Responses > Chat`，所以你在网关侧调三种格式都会被转成上游真实协议。
-
-### 3.3 代码层：活透传（`src/llm_client.py`）
-
-旧写法写死两行是瓶颈：`{"max_tokens":100000,"temperature":0}`。现已改为全透传：
-
-```python
-# 最灵活：你拼任意合法 JSON，我只注入 model/base_url/key 后 POST
-from llm_client import generic_request
-payload, usage = generic_request(
-    {"messages": [{"role":"user","content":"hi"}], "temperature": 0.2, "reasoning_effort": "low"},
-    endpoint="chat",  # "chat"|"responses"|"messages" 或 "/v1/chat/completions" 等
-    base_url="http://YOUR_GATEWAY_HOST:2113/v1",
-    model="OC/muse-spark-1.3-contributor-free",
-)
-
-# 型别入口（均 **kwargs 直通 body）
-from llm_client import chat_completions, responses_create, anthropic_messages
-text, usage, raw = chat_completions(messages, temperature=0.2, max_completion_tokens=8192, reasoning_effort="low")
-text, usage, raw = responses_create("hi", instructions="你是OCR...", max_output_tokens=8192, reasoning={"effort":"low"})
-text, usage, raw = anthropic_messages(messages, max_tokens=4096, system="你是OCR...", temperature=0.3)
-
-# 视觉便捷（detail + **kwargs）
-from llm_client import chat_vision, responses_vision, anthropic_vision
-text, usage = chat_vision(png_bytes, prompt, detail="high", temperature=0, max_tokens=10000)
-text, usage = responses_vision(png_bytes, prompt, detail="high", reasoning_effort="low")
-text, usage = anthropic_vision(png_bytes, prompt, system="你是OCR...", temperature=0)
-
-# 远端 URL 免 base64（网关拉取）
-from llm_client import chat_vision_url, responses_vision_url, anthropic_vision_url
-text, usage = chat_vision_url("https://example.com/a.png", prompt, detail="high")
-
-# 兼容旧调用（仍可用）
-from llm_client import chat_text, chat_vision_auto
-text, usage = chat_text("hi", temperature=0.2)
+```
+PDF page --render.py(200dpi)--> PNG bytes
+  --> llm_client.*_vision(PNG, ocr_system.md, detail=high, **extra)
+        chat:      messages[].content[{text},{image_url:{url:data|https,detail}}]
+        responses: input[{role:user,content:[{input_text},{input_image}]}] (must wrap message)
+        messages:  content[{text},{image:{source:{base64|url}}}]
+  --> page Markdown
+  --> check_notation.py gate (0 issues)
+  --> pages/page_NNNN.md (+ usage.jsonl row: endpoint/extra/tokens)
+  --> postprocess.clean_md + merge_pages --> book.md
+  --> make_searchable(raster + md [+boxes]) --> book_searchable.pdf
+  --> verify_searchable(keywords) --> hits / copyable chars
 ```
 
-关键实现：`_resolve_endpoint(base_url, api_path)` 自动防 `/v1/v1` 双写，支持 `bare host:port` 自动补 `http://` 与 `https` 443 判定；`_merge_body_kwargs` 合并 `extra`/`extra_json`；默认 `max_tokens=100000 / temperature=0` 仅在调用方未指定时生效，指定即覆盖。
+### Concurrency & resume
 
-### 3.4 CLI 活参（`ocr_page / batch_plan / postprocess`）
+- `batch_plan.py`: `ThreadPoolExecutor` 1–20 (CLI default 4, lib 1; >8 warns,
+  >20 rejects), semaphore adaptive halving on 429/5xx with recovery,
+  cross-process file lock (`msvcrt`/`fcntl`), `usage.jsonl` append-only —
+  reruns skip `status=success` pages automatically; `skipped` is logged too.
+- Retries: per-leg, 4xx fail fast (never retried), 429/5xx/timeout/`OSError`
+  retried; `auto` mode = responses single-try → chat single-try on
+  429/5xx/timeout/`OSError` only (1+1, no 9x explosion).
+
+## 2. Quickstart
 
 ```bash
-# 单页 OCR：三协议 + 任意参数透传
+pip install -r requirements.txt        # python-dotenv + PyMuPDF
+cp .env.example .env                  # fill in LLM_OCR_KEY (never commit .env)
+python app_gui.py                     # desktop GUI
+python app_gui.py --smoke             # headless 5-tab build check
+python -m src.cli models              # list gateway models
+python -m src.cli probe --image tests/cand_165.png
+```
+
+Single page / batch:
+
+```bash
 python src/ocr_page.py --image tests/cand_165.png --output out/cand_165.md
 python src/ocr_page.py --image tests/cand_165.png --output out/a.md \
   --endpoint chat --detail high \
-  --extra-json '{"temperature":0.2,"max_completion_tokens":8192,"reasoning_effort":"low"}'
-
-python src/ocr_page.py --image tests/cand_165.png --output out/resp.md \
-  --endpoint responses --extra-json '{"reasoning":{"effort":"low"},"max_output_tokens":8192}'
-
-python src/ocr_page.py --image tests/cand_165.png --output out/msg.md \
-  --endpoint messages --system "你是中文 OCR 引擎" --extra-json '{"temperature":0.3}'
-
-# 远端 URL 免 base64
-python src/ocr_page.py --image-url https://example.com/page.png --output out/url.md --detail high
-
-# PDF 渲染后 OCR
-python src/ocr_page.py --pdf "E:/down/.../语音学教程 增订版.pdf" --page 0 --dpi 200 --output out/page0.md --endpoint chat
-
-# 批量（断点续跑，usage.jsonl 追加 endpoint/extra）
-python src/batch_plan.py --dry-run --endpoint responses --extra-json '{"temperature":0.2,"reasoning_effort":"low"}'
-python src/batch_plan.py --pdf "E:/down/.../语音学教程 增订版.pdf" --output-dir out --endpoint chat --detail high --extra-json '{"max_tokens":4096}'
-
-# 后处理 polish 也活透传
-python src/postprocess.py --input out/page21.md --output out/page21.clean.md --polish \
-  --endpoint chat --extra-json '{"temperature":0,"max_tokens":8192}'
+  --extra-json '{"temperature":0.2,"max_completion_tokens":8192}'
+python src/batch_plan.py --dry-run --endpoint responses
+python src/batch_plan.py --pdf book.pdf --output-dir out --endpoint chat
 ```
 
-环境变量 / CLI 优先级（`--extra-json` 合并进 body，优先级最高）：
-
-| 层级 | 变量/参数 | 示例 | 优先级 |
-|---|---|---|---|
-| 环境变量 | `LLM_OCR_BASE_URL` | `http://YOUR_GATEWAY_HOST:2113/v1` | 高 |
-| 环境变量 | `LLM_OCR_MODEL` | `OC/muse-spark-1.3-contributor-free` | 高 |
-| 环境变量 | `LLM_OCR_KEY`（兼容 `LLM_OCR_API_KEY`/`OCTOPUS_API_KEY`） | `sk-octopus-...` | 高 |
-| CLI | `--base-url/--model/--api-key/--endpoint` | 见各 `main()` | 最高 |
-| CLI | `--extra-json` | `'{"temperature":0.2,"reasoning_effort":"low"}'` | 最高（合并进 body） |
-| CLI | `--detail` | `high\|low\|auto` | 高 |
-| 代码默认 | `DEFAULT_BASE_URL/MODEL` + `max_tokens=100000/temperature=0` | — | 最低（可被覆盖） |
-
-敏感信息只读 env/`.env`，不在日志回显。`host:2113` 为 host 网络，不走 Nginx，公网与 `127.0.0.1:2113` 同口；也支持切官方 `https://api.openai.com/v1`。
-
-### 3.5 官方 SDK 直连也可用（最灵活的替代）
-
-Octopus 完全兼容官方 SDK，绕过本项目 `llm_client` 直接调也行：
+SDK-style (bypass CLI, same engine):
 
 ```python
-import openai
-client = openai.OpenAI(base_url="http://YOUR_GATEWAY_HOST:2113/v1", api_key="sk-octopus-...")
-resp = client.chat.completions.create(
-    model="OC/muse-spark-1.3-contributor-free",
-    messages=[{"role":"user","content":[
-        {"type":"text","text": open("prompts/ocr_system.md", encoding="utf-8").read()},
-        {"type":"image_url","image_url":{"url":"data:image/png;base64,...","detail":"high"}}
-    ]}],
-    temperature=0.2, max_completion_tokens=8192,
+from llm_client import generic_request
+payload, usage = generic_request(
+    {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.2},
+    endpoint="chat",   # chat | responses | messages (or full /v1/... path)
 )
 ```
 
-### 3.6 已修正的旧错误
-
-- 模型名固定 `OC/muse-spark-1.3-contributor-free`，裸名 400。
-- `chat` 默认 `max_tokens:100000`，`responses` 默认 `max_output_tokens:100000`，推理页 `<16` 会 400，现可被 `--extra-json` 覆盖为更小值（如 4096）。
-- `responses` 必须包 `input:[{role, content:[input_text, input_image]}]`。
-- 视觉 `data:` 为本地先 base64（`--image` 自动转），`https:` 为远端由网关拉取，均走 `llm.MessageContentPart` 透传；IPA 推荐 `detail:"high"`。
-
 ---
 
-## 4. 标号位置语法（最高优先级）
+# llm-ocr 中文手册
 
-| 位置 | 写法 | 例 |
-|---|---|---|
-| 正下 | `$\underset{x}{Y}$` | `$[\underset{w}{t}]$` `$[\underset{w}{k}]$` `$[\underset{w}{tɕ'}]$` |
-| 正上 | `$\overset{x}{Y}$` | `$\overset{h}{t}$` |
-| 左上 | `${}^{x}Y$` | — |
-| 左下 | `${}_{x}Y$` | — |
-| 右上 | `$Y^{x}$` | `$[k^{h}]$` `$[a^{35}]$` |
-| 右下 | `$Y_{x}$` | `$[t_{w}]$`类按实际位置用 |
+## 1. 项目定位
 
-规则：公式外套`$...$`，花括号配对，禁止`[t_w]/[tw]/^w`，`tɕ/tʂ`复合音标与`ʰ ː ˈ ³⁵`原样保留。`ocr_system.md`含3正例2反例，`check_notation.py + notation_cases.json(≥12条)`做门禁。
+扫描版中文语音学教材的 Vision-LLM OCR 工具链：逐页高精度 Markdown 转录
+（IPA 原样、附标位置语法正确）+ 原尺寸光栅垫底的双层可搜索 PDF。
+桌面 GUI（Tkinter，纯标准库）与 CLI 共用同一套 `src/` 引擎；
+网关只要求 OpenAI 兼容（`chat / responses / messages` 三入站全开即可，
+实测为 Octopus 网关；OpenAI / AxonHub 同协议可直接换）。
 
----
+核心设计取舍：
 
-## 5. 可能遇到的问题与对策
+- **引擎与界面分离**：`src/` 不 import 任何 GUI；`gui/` 只做参数搬运 +
+  后台线程调度（`Runner`）+ 日志泵（`LogBus`），OCR 逻辑无重复。
+- **配置双轨**：`GlobalConfig{base_url,model,key,timeout}` vs
+  `RunConfig{endpoint,detail,concurrency,dpi,retries,system,extra}`，
+  优先级 CLI > 环境变量 > 默认值；Key 只驻内存，`write_env()` 永不写明文，
+  日志只打 `sk-**** + key_len`。
+- **全透传**：`generic_request + **kwargs / --extra-json`，任意官方字段直达
+  网关 body，`model/stream` 除外；不写死 temperature / max_tokens。
+- **旧文字层绝不复用**：扫描书自带文字层多为乱码，一律丢弃，以原页光栅重建。
 
-1. **代理污染**：SDK读代理失败。对策：只用`http.client/curl`直连或本项目 `llm_client`（已走直连），`LLM_OCR_BASE_URL` 可切官方。
-2. **空回/超时**：大图+ xhigh 推理慢。对策：`--extra-json '{"reasoning_effort":"low"}'` 缩短首字，`timeout=300`，串行，重试2次。
-3. **传参错误**：错名/缺 `max`/`input` 未包 message 致 400。对策：固定 `OC/` 前缀 + `responses` 必包 message + `detail high|low|auto`；活参用 `--extra-json` 透传。
-4. **写死参数不灵活**：旧代码锁 `max_tokens/temperature`。对策：已改为 `**kwargs` 全透传，任意官方字段都能过。
-5. **boxes不准**：差字漂移。对策：抽查标题/首段/IPA段3行，误差>20px或文本不一致即fallback，不直写。
-6. **图片超限**：300dpi b64约2.4MB超 1.5MB。对策：默认200dpi，>1.5MB自动降150dpi重试。
-7. **旧层污染**：错字映射。对策：永远新建PDF（背景PNG+新层），不复用原页对象。
-8. **中文路径写失败**：`EISDIR`。对策：Python `pathlib.write_text(encoding="utf-8")` 落盘。
-9. **成本**：全书约200万tokens。对策：先跑164/165/166三页IPA端到端（已验证双链路 200），确认后再全量；小 `max_tokens` 可省费用。
+## 2. 目录结构
 
----
-
-## 6. 开箱向导与默认真相表（v5 封装终版）
-
-### 6.1 向导（不改代码跑全流程）
-
-```bash
-# 1. 填 URL/Key（--key-stdin布尔开关；管道/TTY/优先级见§6.4）
-python -m src.cli config --init   # base_url → Key掩码/--key-stdin → models选择/手填 → endpoint responses → concurrency 4 → 写.env
-# 2. 拉取并选择模型（任何GET失败均降级手填不阻塞）
-python -m src.cli models          # 唯一入口 GET /v1/models
-# 3. 脱敏核验
-python -m src.cli config --check  # key仅 sk-**** + key_len
-# 4. 设并发 → 选endpoint → dry-run看303页规划 → 1页真跑
-python -m src.cli batch --pdf "<书>.pdf" --output-dir out --dry-run --endpoint responses
-python -m src.cli probe --image tests/cand_165.png --endpoint auto   # 落 out/probe.json
-python -m src.cli batch --pdf "<书>.pdf" --output-dir out --start 0 --end 1 --concurrency 4 --endpoint responses
-# 5. 薄问答（解环，interactive.py为shim）
-python -m src.cli --tui
+```
+llm-ocr/
+  app_gui.py            # GUI 唯一入口（Tkinter；frozen EXE 同路）
+  gui/                  # 界面层（stdlib only）：gui_core + 5 个 tab_*
+    gui_core.py         # 主题/State/Runner/LogBus/apply_theme/init_dpi
+    tab_connect.py      # 1·连接：同步参数/拉模型/单图探活/脱敏核验
+    tab_single.py       # 2·单页：图片/PDF单页/图片链接 OCR
+    tab_batch.py        # 3·批量：断点续跑 + usage.jsonl 实时计数
+    tab_searchable.py   # 4·双层：构建 book_searchable.pdf + 关键词验证
+    tab_params.py       # 5·参数：链路/清晰度/并发/超时/DPI/重试/透传JSON
+    app_gui.py          # shim：dev 与 EXE 单代码路径
+  src/                  # 引擎层
+    config.py           # 中央配置（Global/Run 双 dataclass，dotenv 首句加载）
+    llm_client.py       # 三协议传输核心（982 行，见第 4 章）
+    ocr_page.py         # 单页 OCR（image / pdf-page / image-url）
+    batch_plan.py       # 批量（线程池/自适应并发/dry-run/usage.jsonl）
+    render.py           # PyMuPDF 按页渲染 PNG（默认 200dpi）
+    make_searchable.py  # 双层 PDF（光栅背景 + 隐藏文字层）
+    postprocess.py      # clean_md（中文标点/页脚/公式保护）+ merge_pages
+    check_notation.py   # 标号门禁（禁 [t_w]、丢附标、未配对$/{}）
+    verify_searchable.py# 成品验证（关键词命中页/可复制字数/compare_md）
+    cli.py              # 统一入口 models/probe/ocr/batch/config/--tui
+    cli_common.py       # flag 单源 add_llm_args（各入口共用）
+    interactive.py      # shim：转调 cli.main（解 import 环）
+    conn_test.py        # 占位小脚本（print 123）
+  prompts/
+    ocr_system.md       # OCR 系统提示词（转录 8 条 + 标号语法最高优先级）
+    notation_spec.md    # 六位置映射 + IPA 保留清单 + 校验要点
+  tests/                # 样张 cand_165/166/167.png + page21_150.png 等
+  requirements.txt      # python-dotenv + PyMuPDF（仅此两个运行时依赖）
+  .env.example          # 可配 URL 契约文档（.env 本体 git-ignored）
+  llm-ocr-gui.spec      # PyInstaller 打包配置（排重后约 32MB）
+  out/                  # 运行产物目录（git-ignored；随仓库只留 gui_redesign 报告）
 ```
 
-### 6.2 默认真相表
+## 3. 配置体系（src/config.py）
 
-| 项 | 库默认 | CLI默认 | 备注 |
-|---|---|---|---|
-| endpoint | `chat` | `responses` | `--endpoint chat` 回旧行为 |
-| concurrency | `1` | `4` | `1..20` 硬校验；`>20` 拒绝；`>8` 警告 |
-| max_tokens | `8192`（chat `max_tokens` / responses `max_output_tokens`） | 同左 | opt-in 双键：chat `'{"max_tokens":100000}'` / responses `'{"max_output_tokens":100000}'`；anthropic `4096 experimental` 不动 |
-| timeout | POST `90`（`--timeout` 覆盖） | 同左 | POST-only；GET `/v1/models` 恒 15s single-try |
-| detail | `high` | 同左 | IPA 推荐 high |
+- `GlobalConfig`：`base_url / model / key / timeout`（where to talk）。
+- `RunConfig`：`endpoint / detail / concurrency / dpi / retries / system /
+  extra`（how to talk）。
+- 优先级：`CLI flag > 环境变量 > DEFAULT`；`dpi/retries` 仅 CLI（无 env
+  回退）；`LLM_OCR_PORT` 已废弃（设了就 warn 并忽略，唯一旋钮是 base_url）。
+- CLI 默认 `endpoint=responses` / 并发 4；库默认 `chat` / 并发 1；
+  `ns.is_cli` 区分两者。
+- Key 卫生：只从 `api_key / --key-stdin / LLM_OCR_KEY / LLM_OCR_API_KEY /
+  OCTOPUS_API_KEY / OCTOPUS_KEY` 读；`check()` 只打印打码长度。
 
-### 6.3 auto 1+1（形式语义）
+`.env.example` 即契约文档：`LLM_OCR_BASE_URL` 必须是 `/v1` 根
+（不是 `/v1/chat/completions`），模型在 Octopus 上是分组名（`OC/` 前缀
+必须保留，裸名 400），其余官方字段走 `--extra-json`。
 
-`auto_vision()` 单点：先 `responses` single-try；仅当 `HttpError.status in (429, 500..599)` / `timeout` / `OSError` 时回退 `chat` single-try（1+1，不做 3× 后回退）；`400/401/403/404` 直接抛（fail-fast，不回退不重试）；回退独立于 `retries`（auto 下 legs 内部亦不重试，非 auto 才 3×）；`usage.jsonl` 记实际命中 `endpoint_normalized` + `endpoint_requested="auto"` + `attempt` 区分 leg。`messages` 为 experimental（不保证，不进 auto 集；CLI/库命中即 warn）。
+## 4. 传输层（src/llm_client.py）
 
-### 6.4 并发与自适应
+三层 API（由活到死）：
 
-建议 `4`；`>8` 警告；自适应 `BoundedSemaphore`（初值=concurrency，复用同一 slot 含 auto 回退 leg）：遇 HTTP 429（每次计 1）→ 该 worker 退避 + 上限半减（下限 1）+ `429_count++`；回升 = 连续 20 成功 +1 至初值；耗时以实测 `elapsed_p50_ms/p95_ms` 为准（`--concurrency 20` 上限校验通过但耗时不承诺）。`LLM_OCR_PORT` 废弃（读到即 warn 忽略，`base_url` 唯一口径）。Key 不落 git、不在日志明文（仅 `sk-**** + key_len`；`--api-key` 即 warn）。
+1. `generic_request(endpoint, body, **kw)` —— 你拼任意合法 JSON，
+   只注入 model/base_url/key 后 POST；endpoint 可写别名或完整 `/v1/...`。
+2. 型别入口 —— `chat_completions / responses_create / anthropic_messages`
+  （均 `**kwargs` 直通 body）。
+3. 视觉便捷 —— `chat_vision / responses_vision / anthropic_vision`
+  （本地 PNG 先 base64 体感直传）及 `chat_vision_url /
+   responses_vision_url / anthropic_vision_url`（远端 https 由网关拉取，
+   免 base64）；`detail: high|low|auto`（IPA 小字推荐 high）。
+4. `auto_vision()` —— responses 单试，仅 429/5xx/timeout/OSError 回退 chat
+   单试（1+1）；400/401/403/404 直接抛。
 
-### 6.5 成本双轨
+可靠性：`HttpError` 区分可重试与 fail-fast；POST 超时 90s（`--timeout` 可调），
+`GET /v1/models` 固定 15s 单试；`Retry-After` 上限 60s；
+`_resolve_endpoint()` 防 `/v1/v1` 双写，支持 bare host:port 自动补
+`http://` 与 https-443 判定。
 
-主表 probe 实测 ×303（responses ~330k / chat ~633k tokens）；2M 仅 worst-case 列（`dpi_benchmark` 外推，待校准）。
+## 5. OCR 链路（单页 / 批量 / 后处理 / 双层 / 验证）
 
-### 6.6 `.env` 模板
+1. **渲染**（`render.py`）：`render_page(pdf, pno_0based, dpi=200) -> PNG
+   bytes`；推荐 200dpi（IPA 页约 1184x1788，b64 约 1.1MB；300dpi 约 2.4MB
+   易超限）；参数强校验（类型/正数/越界）。
+2. **单页**（`ocr_page.py`）：三种来源 image / pdf-page / image-url；
+   `--endpoint/--detail/--extra-json` 活参；输出页 MD。
+3. **批量**（`batch_plan.py`）：线程池 + 自适应并发（429/5xx 半减、成功回升）、
+   `--dry-run` 先看页数规划、`usage.jsonl` 追加写（含 endpoint/extra/tokens，
+   断点续跑：success 自动跳过，skipped 也记行）、起止页范围、失败重试 2 次。
+4. **标号门禁**（`check_notation.py`）：`prompts/notation_spec.md` 的机器化身 —
+   禁 `[t_w]` 类 ASCII 下标、禁丢附标 `[tw]`、禁公式外
+   `\underset/\overset`、未配对 `$`/`{}`、孤立 `^/__`、显示公式定界符；
+   门禁目标 0 issues。
+5. **后处理**（`postprocess.py`）：源码 ASCII-only，中文标点由转义码点构造；
+   页脚 `· n ·` 单独成行；代码围栏与 LaTeX 先保护后恢复；
+   `merge_pages` 页间 `<!-- PAGE n -->` + 头部索引；
+   `polish_with_llm` 同样三协议活透传。
+6. **双层**（`make_searchable.py`）：原页光栅做全页背景（尺寸不变，
+   `maxdiff=0` 无二次压缩）；boxes 可靠（`reliable≠false`）走
+   `render_mode=3` 按盒精确写入，否则 fallback 双副本
+   （0.5pt 全文隐藏副本 + 按行均匀 8pt 分布），保证可搜可复制。
+7. **验证**（`verify_searchable.py`）：`verify(pdf, keywords)` 逐页关键词命中 +
+   可复制总字数；`compare_md` 用 difflib 相似度比对两份 Markdown。
 
-见 `.env.example`：`LLM_OCR_CONCURRENCY=4`、`LLM_OCR_DETAIL=high`、`LLM_OCR_ENDPOINT=responses`、`LLM_OCR_TIMEOUT=90`（POST-only 注释）+ models 示例；`.gitignore` 含 `.env` + `out/`。
+## 6. GUI（app_gui.py + gui/）
 
-## 7. 验证与交付（旧§6后移）
+- 单入口 `python app_gui.py`（`--smoke` 无头构建 5 页签，不进 mainloop）；
+  `gui/app_gui.py` 为 shim，dev 与 frozen EXE 单代码路径
+  （`_MEIPASS` 处理）。
+- `gui_core.py`：纸面档案室主题（`apply_theme`，clam 基）、字体 token
+  （Microsoft YaHei UI / Consolas）、共享 `State`（Key 只驻内存）、
+  `Runner`（阻塞调用丢守护线程，完成回 UI 线程）、`LogBus`
+  （线程安全队列 + `after(120)` 泵）、卡片/行/输出区小构件。
+- **DPI 自适应**（`init_dpi`，零开关）：建窗前进程级 Per-Monitor V2
+  （`SetProcessDpiAwareness(2)`，失败回退 `SetProcessDPIAware`）→ 建窗后读
+  本窗所在显示器真实 DPI（`GetDpiForWindow` → `GetDeviceCaps(LOGPIXELSX)` →
+  `winfo_fpixels` → 96 兜底），设 `tk scaling = dpi/72`；
+  换显示器/改缩放后重开即自动适配。注意参数页“DPI”滑杆是 OCR **渲染**
+  分辨率，与界面缩放无关。
+- 5 页签：`tab_connect`（同步参数/拉模型/探活）→ `tab_single` →
+  `tab_batch`（`usage.jsonl` 实时计数 p50/p95）→ `tab_searchable` →
+  `tab_params`（链路/清晰度/并发/超时/DPI/重试/透传 JSON + 看提示词 +
+  标号校验）。
 
-- `check_notation`全量0 issues，cases全过。
-- 双层PDF背景`maxdiff=0`，`get_text`命中顺/逆同化，可复制字数>0。
-- `usage.jsonl`可断点续跑，追加 `endpoint/extra` 便于复盘，最终交付`book.md + book_searchable.pdf + 验证报告`（`out/probe_ocr_chat.json` chat 200 19.1s + `out/probe_ocr_responses.json` responses 200 7.3s 双证据）。
-- `python -m py_compile src/*.py` 全过；`batch_plan --dry-run --endpoint {chat|responses|messages}` 均验证 303 页规划正常。
+## 7. CLI（src/cli.py + cli_common.py）
+
+`python -m src.cli <models|probe|ocr|batch|config> [--tui]`；
+`add_llm_args()` 是 flag 单源（`--base-url/--model/--api-key/--key-stdin/
+--endpoint/--detail/--extra-json/--timeout/--system`，批量再加
+`--concurrency`）；`--key-stdin` 三态（api_key 优先 + warn / TTY 报错 /
+管道全读）；`--api-key` 明文传参会 warn（推荐 env / 管道）。
+
+## 8. 打包
+
+`llm-ocr-gui.spec`（PyInstaller）：`pathex` 覆盖根/src/gui；
+`datas` 带提示词与样张；`hiddenimports` 列全引擎+界面模块；
+`excludes` 剔除 torch/transformers/gradio 等巨型簇（v1 372MB → v2 约 32MB）。
+DPI 代码仅 `ctypes`（标准库，随包走）+ tkinter，无新增依赖，frozen 下同样先生效。
+
+## 9. 安全与限制
+
+- Key 永不进仓库（`.gitignore`: `.env / out/ / __pycache__ / dist/ /
+  build*`）；`--extra-json` 不要塞密钥类字段。
+- `out/` 为本地运行产物（book/pages/usage.jsonl/双层 PDF），不随仓库发布。
+- `tests/` 样张仅为调试用小图；整书 PDF 请自行准备（`OCR_PDF_PATH` 或
+  `--pdf` 指定）。
+- `src/conn_test.py` 为占位脚本，无业务逻辑。
