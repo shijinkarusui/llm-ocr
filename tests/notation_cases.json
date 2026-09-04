@@ -1,69 +1,69 @@
 [
   {
-    "name": "positive_direct_below",
-    "input": "$[\\underset{w}{t}]$",
+    "name": "positive_unicode_labialized",
+    "input": "[tʷ]",
     "expect_ok": true,
-    "note": "正下圆唇化，w 与 t 位置明确"
+    "note": "唇化ʷ与基符号直接组合"
   },
   {
-    "name": "positive_direct_above",
-    "input": "$[\\overset{h}{k}]$",
+    "name": "positive_unicode_aspirated",
+    "input": "[kʰ]",
     "expect_ok": true,
-    "note": "正上送气附标"
+    "note": "送气ʰ上标原样保留"
   },
   {
-    "name": "positive_upper_left",
-    "input": "${}^{j}ɕ$",
+    "name": "positive_unicode_palatalized",
+    "input": "ɕʲ",
     "expect_ok": true,
-    "note": "左上附标，使用空基参数"
-  },
-  {
-    "name": "positive_lower_left",
-    "input": "${}_{n}t$",
-    "expect_ok": true,
-    "note": "左下附标"
-  },
-  {
-    "name": "positive_upper_right",
-    "input": "$k^{ʰ}$",
-    "expect_ok": true,
-    "note": "右上 IPA 送气标记"
-  },
-  {
-    "name": "positive_lower_right",
-    "input": "$Y_{w}$",
-    "expect_ok": true,
-    "note": "右下附标"
+    "note": "腭化ʲ上标原样保留"
   },
   {
     "name": "positive_complex_base",
-    "input": "$[\\underset{w}{tɕ'}]$",
+    "input": "[tɕʷ]",
     "expect_ok": true,
-    "note": "复杂 IPA 基符号必须整体保留"
+    "note": "复杂基符号tɕ整体保留+唇化组合"
   },
   {
-    "name": "positive_ipa_unicode",
-    "input": "[tʷ][kʰ][³⁵]",
+    "name": "positive_tone_length_stress",
+    "input": "[maŋ³⁵][kʰ][tʷ][aː][ˈma]",
     "expect_ok": true,
-    "note": "原生 Unicode IPA 标记原样保留"
+    "note": "声调/长音/重音原样保留"
+  },
+  {
+    "name": "positive_combining_tilde",
+    "input": "[ã]",
+    "expect_ok": true,
+    "note": "组合鼻化符与基字符成一字形单位"
+  },
+  {
+    "name": "positive_plain_chinese",
+    "input": "语音学是研究人类说话声音的学科。",
+    "expect_ok": true,
+    "note": "中文正文无附加符号即通过"
+  },
+  {
+    "name": "positive_footer",
+    "input": "· 1 ·",
+    "expect_ok": true,
+    "note": "页脚单独成行保留"
+  },
+  {
+    "name": "positive_gfm_table",
+    "input": "| a | b |\n| --- | --- |\n| [tʷ] | [kʰ] |",
+    "expect_ok": true,
+    "note": "GFM表格内音标及附加符号原样保留"
   },
   {
     "name": "negative_plain_underscore_t",
     "input": "[t_w]",
     "expect_ok": false,
-    "note": "禁用普通下划线写法"
+    "note": "禁用ASCII下划线写法，用ʷ"
   },
   {
     "name": "negative_plain_underscore_k",
     "input": "[k_w]",
     "expect_ok": false,
-    "note": "禁用普通下划线写法"
-  },
-  {
-    "name": "negative_plain_underscore_d",
-    "input": "[d_w]",
-    "expect_ok": false,
-    "note": "禁用普通下划线写法"
+    "note": "禁用ASCII下划线写法，用ʷ"
   },
   {
     "name": "negative_plain_underscore_tc",
@@ -72,81 +72,81 @@
     "note": "禁用复合声母下划线写法"
   },
   {
+    "name": "negative_caret_bracket",
+    "input": "[k^h]",
+    "expect_ok": false,
+    "note": "禁用方括号内线性caret，用ʰ"
+  },
+  {
     "name": "negative_dropped_w",
     "input": "[tw]",
     "expect_ok": false,
-    "note": "w 被直接拼接，位置信息丢失"
+    "note": "w被直接拼接，位置信息丢失，用ʷ"
+  },
+  {
+    "name": "negative_dropped_w_complex",
+    "input": "[tɕ'w]",
+    "expect_ok": false,
+    "note": "复杂基符号后拼接w，用ʷ组合"
+  },
+  {
+    "name": "negative_ascii_h",
+    "input": "[kh]",
+    "expect_ok": false,
+    "note": "普通h不是送气符，用ʰ"
+  },
+  {
+    "name": "negative_ascii_j",
+    "input": "[ɕj]",
+    "expect_ok": false,
+    "note": "普通j不是腭化符，用ʲ"
   },
   {
     "name": "negative_unwrapped_caret",
-    "input": "^wY",
-    "expect_ok": false,
-    "note": "左上附标脱离公式"
-  },
-  {
-    "name": "negative_unbraced_right_up",
-    "input": "$Y^w$",
-    "expect_ok": false,
-    "note": "右上参数未用花括号"
-  },
-  {
-    "name": "negative_unbraced_right_down",
-    "input": "$Y_w$",
-    "expect_ok": false,
-    "note": "右下参数未用花括号"
-  },
-  {
-    "name": "negative_command_outside_math",
-    "input": "[\\underset{w}{t}]",
-    "expect_ok": false,
-    "note": "位置命令必须包在行内公式中"
-  },
-  {
-    "name": "negative_unmatched_brace",
-    "input": "$[\\underset{w}{t]$",
-    "expect_ok": false,
-    "note": "花括号未配对"
-  },
-  {
-    "name": "negative_direct_above_linear",
-    "input": "[k^h]",
-    "expect_ok": false,
-    "note": "正上附标不能写成方括号内线性 caret"
-  },
-  {
-    "name": "negative_upper_left_linear",
     "input": "^jɕ",
     "expect_ok": false,
-    "note": "左上附标不能脱离公式直接写 caret"
+    "note": "脱离转写的裸caret，用ʲ组合"
   },
   {
-    "name": "negative_lower_left_linear",
+    "name": "negative_unwrapped_underscore",
     "input": "_nt",
     "expect_ok": false,
-    "note": "左下附标不能脱离公式直接写 underscore"
+    "note": "脱离转写的裸underscore"
   },
   {
-    "name": "negative_upper_right_linear",
-    "input": "$Y^w$",
+    "name": "negative_latex_underset",
+    "input": "$[\\underset{w}{t}]$",
     "expect_ok": false,
-    "note": "右上附标必须使用花括号"
+    "note": "LaTeX位置语法禁用，用[tʷ]"
   },
   {
-    "name": "negative_lower_right_linear",
-    "input": "$Y_w$",
+    "name": "negative_latex_overset",
+    "input": "$[\\overset{h}{k}]$",
     "expect_ok": false,
-    "note": "右下附标必须使用花括号"
+    "note": "LaTeX位置语法禁用，用[kʰ]"
   },
   {
-    "name": "positive_bracketed_upper_right",
-    "input": "$[k^{ʰ}]$",
-    "expect_ok": true,
-    "note": "方括号内右上 IPA 附标"
+    "name": "negative_latex_dollar",
+    "input": "$k^{ʰ}$",
+    "expect_ok": false,
+    "note": "美元符包裹禁用，直接写kʰ"
   },
   {
-    "name": "positive_bracketed_lower_right",
-    "input": "$[Y_{w}]$",
-    "expect_ok": true,
-    "note": "方括号内右下附标"
+    "name": "negative_split_combining",
+    "input": "t ʷ",
+    "expect_ok": false,
+    "note": "基字符与组合符之间不得加空格"
+  },
+  {
+    "name": "negative_stray_combining",
+    "input": "̃maŋ",
+    "expect_ok": false,
+    "note": "游离组合符无基字符"
+  },
+  {
+    "name": "negative_unbalanced_bracket",
+    "input": "[tʷ",
+    "expect_ok": false,
+    "note": "方括号未配对"
   }
 ]

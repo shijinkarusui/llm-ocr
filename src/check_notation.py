@@ -7,13 +7,33 @@ from pathlib import Path
 from typing import Any
 
 
-BANNED_BRACKET_MARK = re.compile(r"\\?\[[^\]\r\n]*[_^][^\]\r\n]*\\?\]")
-DROPPED_W = re.compile(r"\\?\[(?:tc|tɕ|t|k|d)w\\?\]")
-DISPLAY_DELIMITER = re.compile(r"\\\[|\\\]")
-MATH_DELIMITER = re.compile(r"(?<!\\)\$")
-POSITION_COMMAND = re.compile(r"\\(underset|overset)\b")
+# Transcription contract: prompts/ocr_system.md + prompts/notation_spec.md.
+# Output is plain Markdown with Unicode combining IPA diacritics. LaTeX
+# position syntax (\underset / \overset / $...$ / \[...\]) is forbidden:
+# attached marks must be single Unicode glyph units with their base.
+
+# ASCII fallback inside square-bracket transcription, e.g. [t_w] or [k^h].
+BANNED_BRACKET_MARK = re.compile(r"\[[^\]\r\n]*[_^][^\]\r\n]*\]")
+# Attached labialization concatenated with its base, e.g. [tw] or [tɕ'w].
+DROPPED_W = re.compile(r"\[(?:tɕ'?|tc'?|[tkdp])[wW]\]")
+# Plain ASCII aspiration / palatalization in brackets, e.g. [kh] or [ɕj].
+ASCII_MODIFIER_HJ = re.compile(r"\[(?:[kpt][hH]|[ɕnl][jJ])\]")
+# LaTeX leftovers: position commands, unescaped dollars, display delimiters.
+LATEX_RESIDUE = re.compile(r"\\(?:underset|overset)\b|(?<!\\)\$|\\\[|\\\]")
+# Bare ASCII position operators outside bracket transcription.
 RAW_ASCII_POSITION = re.compile(r"(?<!\\)[_^]")
-ADJACENT_MATH_DELIMITER = re.compile(r"\]\$\$\[")
+# Combining diacritic separated from its base by whitespace, e.g. "t ʷ".
+SPLIT_COMBINING = re.compile(
+    r"[A-Za-zɕŋəɛɔɑβʔʂʐɖɳɭɰɣʃʒɹɿʅɦɥɤɲ'’]\s+"
+    r"[ʷʰʲː̃̚ˈˌ\u0300-\u036F\u1AB0-\u1AFF\u1DC0-\u1DFF\u20D0-\u20FF\uFE20-\uFE2F]"
+)
+# Combining diacritic with no base character before it.
+STRAY_COMBINING = re.compile(
+    r"(?:^|[\s\u3000-\u303F\uFF00-\uFFEF.,;:!?，。；：“”‘’（）|(){}\[\]])"
+    r"[\u0300-\u036F\u1AB0-\u1AFF\u1DC0-\u1DFF\u20D0-\u20FF\uFE20-\uFE2F]",
+    re.MULTILINE,
+)
+BRACKET_SPAN = re.compile(r"\[[^\[\]\r\n]*\]")
 
 
 def _issue(code: str, message: str, position: int, text: str) -> dict[str, Any]:
@@ -26,106 +46,36 @@ def _issue(code: str, message: str, position: int, text: str) -> dict[str, Any]:
     }
 
 
-def _math_spans(text: str) -> tuple[list[tuple[int, int]], list[int]]:
-    positions = [m.start() for m in MATH_DELIMITER.finditer(text)]
-    spans = [(positions[i], positions[i + 1]) for i in range(0, len(positions) - 1, 2)]
-    return spans, positions
+def _bracket_spans(text: str) -> list[tuple[int, int]]:
+    return [(m.start(), m.end()) for m in BRACKET_SPAN.finditer(text)]
 
 
 def _inside(position: int, spans: list[tuple[int, int]]) -> bool:
     return any(start < position < end for start, end in spans)
 
 
-def _read_braced(text: str, start: int | None) -> int | None:
-    if start is None:
-        return None
-    while start < len(text) and text[start].isspace():
-        start += 1
-    if start >= len(text) or text[start] != "{":
-        return None
-    depth = 0
+def _balanced_delimiters(text: str) -> list[dict[str, Any]]:
+    problems: list[dict[str, Any]] = []
+    stack: list[tuple[str, int]] = []
+    pairs = {"{": "}", "[": "]", "(": ")"}
+    closing = set(pairs.values())
     escaped = False
-    for index in range(start, len(text)):
-        char = text[index]
+    for index, char in enumerate(text):
         if escaped:
             escaped = False
             continue
         if char == "\\":
             escaped = True
-        elif char == "{":
-            depth += 1
-        elif char == "}":
-            depth -= 1
-            if depth == 0:
-                return index + 1
-            if depth < 0:
-                return None
-    return None
-
-
-def _balanced_delimiters(text: str, spans: list[tuple[int, int]]) -> list[dict[str, Any]]:
-    problems: list[dict[str, Any]] = []
-    for start, end in spans:
-        stack: list[tuple[str, int]] = []
-        escaped = False
-        pairs = {"{": "}", "[": "]"}
-        closing = set(pairs.values())
-        for index in range(start + 1, end):
-            char = text[index]
-            if escaped:
-                escaped = False
-                continue
-            if char == "\\":
-                escaped = True
-                continue
-            if char in pairs:
-                stack.append((char, index))
-            elif char in closing:
-                if not stack or pairs[stack[-1][0]] != char:
-                    problems.append(_issue("unbalanced_brackets", "closing bracket without opener", index, text))
-                else:
-                    stack.pop()
-        for opener, position in reversed(stack):
-            problems.append(_issue("unbalanced_brackets", "opening bracket without closer", position, text))
-    return problems
-
-
-def _command_problems(text: str, spans: list[tuple[int, int]]) -> list[dict[str, Any]]:
-    problems: list[dict[str, Any]] = []
-    for match in POSITION_COMMAND.finditer(text):
-        if not _inside(match.start(), spans):
-            problems.append(_issue("command_outside_math", "position command is outside inline math", match.start(), text))
             continue
-        first = _read_braced(text, match.end())
-        second = _read_braced(text, first)
-        if first is None or second is None:
-            problems.append(_issue("command_arguments", "position command needs two braced arguments", match.start(), text))
-    return problems
-
-
-def _position_problems(text: str, spans: list[tuple[int, int]]) -> list[dict[str, Any]]:
-    problems: list[dict[str, Any]] = []
-    for match in BANNED_BRACKET_MARK.finditer(text):
-        # Inside math, the bare operator check below distinguishes valid Y_{x}/Y^{x}
-        # from forbidden t_w/k^h. The broad bracket rule applies to plain text only.
-        if not _inside(match.start(), spans):
-            problems.append(_issue("banned_bracket_mark", "bracketed ASCII position mark is forbidden", match.start(), text))
-    for match in DROPPED_W.finditer(text):
-        problems.append(_issue("dropped_attached_mark", "bracketed w appears concatenated with its base", match.start(), text))
-    for match in DISPLAY_DELIMITER.finditer(text):
-        problems.append(_issue("display_math_delimiter", "use inline dollar delimiters", match.start(), text))
-    for match in ADJACENT_MATH_DELIMITER.finditer(text):
-        problems.append(_issue("adjacent_math_delimiter", "adjacent inline formulas share $$; separate with a space", match.start(), text))
-    for match in RAW_ASCII_POSITION.finditer(text):
-        position = match.start()
-        if not _inside(position, spans):
-            problems.append(_issue("position_outside_math", "caret or underscore is outside inline math", position, text))
-            continue
-        before = text[max(0, position - 16):position]
-        if re.search(r"\\(?:under|over)set$", before):
-            continue
-        if position + 1 >= len(text) or text[position + 1] != "{":
-            problems.append(_issue("bare_position_operator", "caret or underscore needs a braced payload", position, text))
+        if char in pairs:
+            stack.append((char, index))
+        elif char in closing:
+            if not stack or pairs[stack[-1][0]] != char:
+                problems.append(_issue("unbalanced_brackets", "closing bracket without opener", index, text))
+            else:
+                stack.pop()
+    for opener, position in reversed(stack):
+        problems.append(_issue("unbalanced_brackets", "opening bracket without closer", position, text))
     return problems
 
 
@@ -171,13 +121,24 @@ def check_text(text: str) -> list[dict[str, Any]]:
     """Check an in-memory Markdown string; useful for focused tests."""
     if not text:
         return []
-    spans, delimiters = _math_spans(text)
+    spans = _bracket_spans(text)
     problems: list[dict[str, Any]] = []
-    if len(delimiters) % 2:
-        problems.append(_issue("unmatched_dollar", "inline math dollar delimiter is unmatched", delimiters[-1], text))
-    problems.extend(_balanced_delimiters(text, spans))
-    problems.extend(_command_problems(text, spans))
-    problems.extend(_position_problems(text, spans))
+    for match in LATEX_RESIDUE.finditer(text):
+        problems.append(_issue("latex_residue", "LaTeX position syntax is forbidden; use Unicode combining", match.start(), text))
+    for match in BANNED_BRACKET_MARK.finditer(text):
+        problems.append(_issue("banned_bracket_mark", "bracketed ASCII position mark is forbidden", match.start(), text))
+    for match in DROPPED_W.finditer(text):
+        problems.append(_issue("dropped_attached_mark", "bracketed w concatenated with its base; use ʷ", match.start(), text))
+    for match in ASCII_MODIFIER_HJ.finditer(text):
+        problems.append(_issue("ascii_modifier_letter", "plain h/j in brackets; use ʰ/ʲ", match.start(), text))
+    for match in SPLIT_COMBINING.finditer(text):
+        problems.append(_issue("split_combining_mark", "combining mark separated from its base by space", match.start(), text))
+    for match in STRAY_COMBINING.finditer(text):
+        problems.append(_issue("stray_combining_mark", "combining mark without a base character", match.start(), text))
+    for match in RAW_ASCII_POSITION.finditer(text):
+        if not _inside(match.start(), spans):
+            problems.append(_issue("ascii_position_operator", "ASCII caret/underscore is not valid IPA notation", match.start(), text))
+    problems.extend(_balanced_delimiters(text))
     return sorted(problems, key=lambda item: (item["position"], item["code"]))
 
 
@@ -192,7 +153,7 @@ def check_file(md_path: str | Path) -> list[dict[str, Any]]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Check inline IPA attached-mark notation")
+    parser = argparse.ArgumentParser(description="Check Unicode IPA combining-mark notation (no LaTeX)")
     parser.add_argument("paths", nargs="*", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -212,4 +173,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -14,7 +14,7 @@ English overview first; full Chinese manual below (Chapters 1-9).
 - **Input**: scanned images / scanned PDF (each page rasterized to PNG).
 - **Output A**: high-fidelity Markdown — whole book `book.md` + per-page
   `pages/page_*.md` (Chinese punctuation normalized, IPA kept verbatim,
-  positional附标 emitted as LaTeX inline math).
+  diacritics emitted as Unicode combining marks).
 - **Output B**: dual-layer searchable PDF `book_searchable.pdf` — original
   raster as background (same page size), plus an invisible searchable text
   layer. The old garbled text layer is never reused.
@@ -30,7 +30,7 @@ English overview first; full Chinese manual below (Chapters 1-9).
                           +-------------------+
                           |   prompts/*.md    |  OCR contract
                           | ocr_system.md     |  (transcription rules,
-                          | notation_spec.md  |   6-position LaTeX map)
+                          | notation_spec.md  |   Unicode combining map)
                           +----+------+-------+
                                |      |
               +----------------+      +-----------------+
@@ -94,8 +94,8 @@ English overview first; full Chinese manual below (Chapters 1-9).
  +----------v---------+ +---------v--------+ +-----------v---------+
  | check_notation.py  | | postprocess.py   | | verify_searchable.py|
  | GATE: banned       | | clean_md (CJK    | | VERIFY: per-page    |
- | [t_w]/lost marks/  | | punct, footers,  | | keyword hits,       |
- | unpaired $/{}      | | protect math) +  | | copyable chars,     |
+ | ascii/lost marks/  | | punct, footers,  | | keyword hits,       |
+ | no LaTeX residue   | | protect math) +  | | copyable chars,     |
  | -> 0 issues gate   | | merge_pages +    | | compare_md diff     |
  |                    | | polish_with_llm  | |                     |
  +----------+---------+ +---------+--------+ +-----------+---------+
@@ -113,7 +113,7 @@ English overview first; full Chinese manual below (Chapters 1-9).
 
 | Layer | Files | Owns | Never touches |
 |---|---|---|---|
-| Contract | `prompts/ocr_system.md`, `prompts/notation_spec.md` | Transcription rules, 6-position附标→LaTeX map, IPA keep-list | Code, keys |
+| Contract | `prompts/ocr_system.md`, `prompts/notation_spec.md` | Transcription rules, Unicode combining map, IPA keep-list | Code, keys |
 | Config | `src/config.py` + `.env.example` | `GlobalConfig` vs `RunConfig`, CLI>env>DEFAULT, dotenv first-import, key masking | Transport, rendering |
 | Transport | `src/llm_client.py` | 3 ingresses, passthrough `**kwargs`, `auto_vision()` 1+1, retries, endpoint normalize | OCR prompts, PDF layout |
 | Page/Batch | `src/ocr_page.py`, `src/batch_plan.py` | Single shot, thread pool + adaptive concurrency, `usage.jsonl` resume | Gateway internals |
@@ -187,7 +187,7 @@ payload, usage = generic_request(
 ## 1. 项目定位
 
 扫描版中文语音学教材的 Vision-LLM OCR 工具链：逐页高精度 Markdown 转录
-（IPA 原样、附标位置语法正确）+ 原尺寸光栅垫底的双层可搜索 PDF。
+（IPA 原样、附加符号 Unicode 组合正确）+ 原尺寸光栅垫底的双层可搜索 PDF。
 桌面 GUI（Tkinter，纯标准库）与 CLI 共用同一套 `src/` 引擎；
 网关只要求 OpenAI 兼容（`chat / responses / messages` 三入站全开即可，
 实测为 Octopus 网关；OpenAI / AxonHub 同协议可直接换）。
@@ -225,15 +225,15 @@ llm-ocr/
     render.py           # PyMuPDF 按页渲染 PNG（默认 200dpi）
     make_searchable.py  # 双层 PDF（光栅背景 + 隐藏文字层）
     postprocess.py      # clean_md（中文标点/页脚/公式保护）+ merge_pages
-    check_notation.py   # 标号门禁（禁 [t_w]、丢附标、未配对$/{}）
+    check_notation.py   # 标号门禁（禁 ASCII 替代、LaTeX 残留、未配对括号）
     verify_searchable.py# 成品验证（关键词命中页/可复制字数/compare_md）
     cli.py              # 统一入口 models/probe/ocr/batch/config/--tui
     cli_common.py       # flag 单源 add_llm_args（各入口共用）
     interactive.py      # shim：转调 cli.main（解 import 环）
     conn_test.py        # 占位小脚本（print 123）
   prompts/
-    ocr_system.md       # OCR 系统提示词（转录 8 条 + 标号语法最高优先级）
-    notation_spec.md    # 六位置映射 + IPA 保留清单 + 校验要点
+    ocr_system.md       # OCR 系统提示词（转录 8 条 + 附加符号识读最高优先级）
+    notation_spec.md    # Unicode 组合规范 + IPA 保留清单 + 校验要点
   tests/                # 样张 cand_165/166/167.png + page21_150.png 等
   requirements.txt      # python-dotenv + PyMuPDF（仅此两个运行时依赖）
   .env.example          # 可配 URL 契约文档（.env 本体 git-ignored）
@@ -288,8 +288,8 @@ llm-ocr/
    `--dry-run` 先看页数规划、`usage.jsonl` 追加写（含 endpoint/extra/tokens，
    断点续跑：success 自动跳过，skipped 也记行）、起止页范围、失败重试 2 次。
 4. **标号门禁**（`check_notation.py`）：`prompts/notation_spec.md` 的机器化身 —
-   禁 `[t_w]` 类 ASCII 下标、禁丢附标 `[tw]`、禁公式外
-   `\underset/\overset`、未配对 `$`/`{}`、孤立 `^/__`、显示公式定界符；
+   禁 `[t_w]`/`[tw]`/`[kh]` 类 ASCII 替代、禁 LaTeX 残留
+   （`\underset`/`\overset`/`$` 定界符）、禁拆分或游离的组合附加符、未配对括号。
    门禁目标 0 issues。
 5. **后处理**（`postprocess.py`）：源码 ASCII-only，中文标点由转义码点构造；
    页脚 `· n ·` 单独成行；代码围栏与 LaTeX 先保护后恢复；
