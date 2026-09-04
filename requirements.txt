@@ -1,0 +1,4 @@
+# llm-ocr runtime deps (Lane A)
+# POST --timeout: llm_client POST-only (GET /v1/models fixed 15s single-try, unaffected).
+python-dotenv>=1.0   # .env autoload (load_dotenv(override=False) first import stmt; missing -> warn+manual export)
+PyMuPDF>=1.23        # PDF raster for render/ocr_page/batch

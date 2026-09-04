@@ -1,0 +1,9 @@
+# llm-ocr ignores (Lane A, contract: key never in git)
+.env
+out/
+__pycache__/
+*.pyc
+dist/
+build/
+build-v2/
+*.spec.bak

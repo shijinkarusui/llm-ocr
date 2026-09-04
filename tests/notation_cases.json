@@ -1,0 +1,152 @@
+[
+  {
+    "name": "positive_direct_below",
+    "input": "$[\\underset{w}{t}]$",
+    "expect_ok": true,
+    "note": "正下圆唇化，w 与 t 位置明确"
+  },
+  {
+    "name": "positive_direct_above",
+    "input": "$[\\overset{h}{k}]$",
+    "expect_ok": true,
+    "note": "正上送气附标"
+  },
+  {
+    "name": "positive_upper_left",
+    "input": "${}^{j}ɕ$",
+    "expect_ok": true,
+    "note": "左上附标，使用空基参数"
+  },
+  {
+    "name": "positive_lower_left",
+    "input": "${}_{n}t$",
+    "expect_ok": true,
+    "note": "左下附标"
+  },
+  {
+    "name": "positive_upper_right",
+    "input": "$k^{ʰ}$",
+    "expect_ok": true,
+    "note": "右上 IPA 送气标记"
+  },
+  {
+    "name": "positive_lower_right",
+    "input": "$Y_{w}$",
+    "expect_ok": true,
+    "note": "右下附标"
+  },
+  {
+    "name": "positive_complex_base",
+    "input": "$[\\underset{w}{tɕ'}]$",
+    "expect_ok": true,
+    "note": "复杂 IPA 基符号必须整体保留"
+  },
+  {
+    "name": "positive_ipa_unicode",
+    "input": "[tʷ][kʰ][³⁵]",
+    "expect_ok": true,
+    "note": "原生 Unicode IPA 标记原样保留"
+  },
+  {
+    "name": "negative_plain_underscore_t",
+    "input": "[t_w]",
+    "expect_ok": false,
+    "note": "禁用普通下划线写法"
+  },
+  {
+    "name": "negative_plain_underscore_k",
+    "input": "[k_w]",
+    "expect_ok": false,
+    "note": "禁用普通下划线写法"
+  },
+  {
+    "name": "negative_plain_underscore_d",
+    "input": "[d_w]",
+    "expect_ok": false,
+    "note": "禁用普通下划线写法"
+  },
+  {
+    "name": "negative_plain_underscore_tc",
+    "input": "[tc_w]",
+    "expect_ok": false,
+    "note": "禁用复合声母下划线写法"
+  },
+  {
+    "name": "negative_dropped_w",
+    "input": "[tw]",
+    "expect_ok": false,
+    "note": "w 被直接拼接，位置信息丢失"
+  },
+  {
+    "name": "negative_unwrapped_caret",
+    "input": "^wY",
+    "expect_ok": false,
+    "note": "左上附标脱离公式"
+  },
+  {
+    "name": "negative_unbraced_right_up",
+    "input": "$Y^w$",
+    "expect_ok": false,
+    "note": "右上参数未用花括号"
+  },
+  {
+    "name": "negative_unbraced_right_down",
+    "input": "$Y_w$",
+    "expect_ok": false,
+    "note": "右下参数未用花括号"
+  },
+  {
+    "name": "negative_command_outside_math",
+    "input": "[\\underset{w}{t}]",
+    "expect_ok": false,
+    "note": "位置命令必须包在行内公式中"
+  },
+  {
+    "name": "negative_unmatched_brace",
+    "input": "$[\\underset{w}{t]$",
+    "expect_ok": false,
+    "note": "花括号未配对"
+  },
+  {
+    "name": "negative_direct_above_linear",
+    "input": "[k^h]",
+    "expect_ok": false,
+    "note": "正上附标不能写成方括号内线性 caret"
+  },
+  {
+    "name": "negative_upper_left_linear",
+    "input": "^jɕ",
+    "expect_ok": false,
+    "note": "左上附标不能脱离公式直接写 caret"
+  },
+  {
+    "name": "negative_lower_left_linear",
+    "input": "_nt",
+    "expect_ok": false,
+    "note": "左下附标不能脱离公式直接写 underscore"
+  },
+  {
+    "name": "negative_upper_right_linear",
+    "input": "$Y^w$",
+    "expect_ok": false,
+    "note": "右上附标必须使用花括号"
+  },
+  {
+    "name": "negative_lower_right_linear",
+    "input": "$Y_w$",
+    "expect_ok": false,
+    "note": "右下附标必须使用花括号"
+  },
+  {
+    "name": "positive_bracketed_upper_right",
+    "input": "$[k^{ʰ}]$",
+    "expect_ok": true,
+    "note": "方括号内右上 IPA 附标"
+  },
+  {
+    "name": "positive_bracketed_lower_right",
+    "input": "$[Y_{w}]$",
+    "expect_ok": true,
+    "note": "方括号内右下附标"
+  }
+]
