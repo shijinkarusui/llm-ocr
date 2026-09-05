@@ -18,8 +18,8 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from make_searchable import _font_for_char, _font_segments, _page_boxes, _usable_boxes, _fallback_only_lines, _metrics_from_lines, _partition_lines, make_searchable
-from verify_searchable import _actual_read_order, _filter_exempt_actual, _table_cell_gate, garble_ratio, verify_alignment
+from make_searchable import _font_for_char, _font_segments, _page_boxes, _usable_boxes, _fallback_only_lines, _metrics_from_lines, _partition_lines, make_searchable, plan_boxed_lines
+from verify_searchable import _actual_read_order, _filter_exempt_actual, _merge_equation_actual_items, _merge_expected_equation_units, _table_cell_gate, garble_ratio, verify_alignment
 from geom_align import align_page, normalize_md
 from geom_extract import _is_header_footer, _is_page_like, extract_lines, extract_repeated_header_anchors, repeated_anchors_from_candidate_sets
 from pilot_alignment import parse_pages
@@ -64,6 +64,29 @@ def test_boxes_schema_preserves_mode_for_page_boxes():
     assert [ln["mode"] for ln in lines] == ["aligned", "fallback_capacity"]
     assert lines[0]["order_exempt"] is False
     assert lines[1]["order_exempt"] is True
+
+
+def test_page_boxes_preserves_external_table_metadata():
+    boxes = {
+        "0": {
+            "reliable": True,
+            "lines": [
+                {
+                    "text": "表 3-2 国际音标全表",
+                    "box": [100, 200, 800, 400],
+                    "source": "mineru",
+                    "mode": "aligned",
+                    "line_id": "M00000000",
+                    "is_table": True,
+                    "table_cells": ["A", "B", "甲", "乙"],
+                }
+            ],
+        }
+    }
+    lines = _page_boxes(boxes, 0)
+    assert lines is not None
+    assert lines[0]["is_table"] is True
+    assert lines[0]["table_cells"] == ["A", "B", "甲", "乙"]
 
 
 def test_usable_boxes_accepts_single_aligned_line():
@@ -395,6 +418,91 @@ def test_table_cell_gate_no_cell_metadata_is_not_implemented():
     assert gate["note"]
 
 
+def test_table_cell_gate_external_mineru_computes_from_table_cells():
+    """External (MinerU) path: llm_pages joins cells with spaces (no pipes), so
+    the gate must use is_table/table_cells metadata for expected cells and the
+    output PDF text inside the table bbox for actual cells."""
+    lines = [
+        {
+            "text": "表3-2 国际音标全表 A B 甲 乙",
+            "box": [100.0, 100.0, 900.0, 500.0],
+            "mode": "aligned",
+            "source": "mineru",
+            "is_table": True,
+            "table_cells": ["A", "B", "甲", "乙"],
+        }
+    ]
+    md = "表3-2 国际音标全表 A B 甲 乙"  # space-joined, no pipes
+    actual_items = [
+        {"text": "AB甲乙", "x0": 100.0, "y0": 100.0, "x1": 900.0, "y1": 500.0}
+    ]
+    gate = _table_cell_gate(lines, False, md, actual_items)
+    assert gate["status"] == "computed"
+    assert gate["expected_cells"] == 4
+    assert gate["matched_cells"] == 4
+    assert gate["cell_recall"] == 1.0
+    assert gate["cell_precision"] == 1.0
+    # Without any output lines in the table region it still reports a computed
+    # (zero-recall) result instead of hiding behind not_implemented.
+    empty = _table_cell_gate(lines, False, md, None)
+    assert empty["status"] == "computed"
+    assert empty["cell_recall"] == 0.0
+
+
+def test_actual_read_order_keeps_wrapped_fragments_in_y_order(tmp_path):
+    """Same-x0 fragments with different widths must stay in y order.
+
+    Regression for page 86: a long wrapped fragment and its short tail share
+    the same x0 inside one box, so the tail's x-center drifts right; the old
+    (row, x-center) sort flipped them. ASCII is used because the synthetic
+    page renders with the default font, which cannot extract CJK text.
+    """
+    pdf = tmp_path / "frag.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=400)
+    page.insert_text(fitz.Point(50, 100), "LONG" * 20, fontsize=10)
+    page.insert_text(fitz.Point(50, 106), "short", fontsize=10)
+    doc.save(pdf)
+    doc.close()
+
+    d = fitz.open(pdf)
+    canon, _items = _actual_read_order(d[0])
+    d.close()
+    assert canon.index("LONG") < canon.index("short")
+
+
+def test_build_mineru_data_uses_normalized_bboxes_and_tags(tmp_path, monkeypatch):
+    """MinerU content_list bboxes are already 0-1000; the tracked builder must
+    keep them verbatim and attach equation/table markup for the verifier."""
+    import build_mineru_data as bmd
+
+    part1 = tmp_path / "p1.json"
+    part2 = tmp_path / "p2.json"
+    part1.write_text(
+        json.dumps([
+            {"page_idx": 0, "type": "text", "text": "A", "bbox": [10, 20, 100, 60]},
+            {"page_idx": 0, "type": "equation", "text": "$$x$$", "bbox": [10, 70, 100, 110]},
+            {
+                "page_idx": 0, "type": "table", "bbox": [10, 120, 200, 200],
+                "table_caption": ["cap"], "table_body": "<tr><td>a</td><td>b</td></tr>",
+            },
+        ]),
+        encoding="utf-8",
+    )
+    part2.write_text(json.dumps([]), encoding="utf-8")
+    monkeypatch.setattr(bmd, "PART1", part1)
+    monkeypatch.setattr(bmd, "PART2", part2)
+    monkeypatch.setattr(bmd, "PART2_OFFSET", 1000)
+
+    md_out, box_out = bmd.build()
+    lines = {ln["line_id"]: ln for ln in box_out["0"]["lines"]}
+    assert [ln["box"] for ln in lines.values()][0] == [10.0, 20.0, 100.0, 60.0]
+    assert any(ln.get("is_equation") for ln in lines.values())
+    table = next(ln for ln in lines.values() if ln.get("is_table"))
+    assert table["table_cells"] == ["a", "b"]
+    assert "a b" in md_out["0"]
+
+
 def test_pilot_parse_pages():
     assert parse_pages("0-2,7") == [0, 1, 2, 7]
     assert parse_pages("0,1,2") == [0, 1, 2]
@@ -507,3 +615,52 @@ def test_normalize_md_preserves_literal_pipes_but_collapses_tables():
     assert "|" in norm
     assert "A B" in norm
     assert "| A | B |" not in norm
+
+
+def test_plan_boxed_lines_marks_equation_region_and_rotates_axis_label():
+    """Equation lines carry an equation_region on every plan entry; a genuine
+    tall-narrow ASCII axis label gets a rotate=90 plan entry instead of wrap."""
+    lines = [
+        {"text": "$$\n\\mathrm{清浊}\n$$", "box": [450, 129, 525, 152], "is_equation": True},
+        {"text": "Frequency (Hz)", "box": [269, 771, 288, 828]},
+        {"text": "[t] [a]", "box": [232, 304, 349, 575]},
+    ]
+    plan, overflow = plan_boxed_lines(lines, 426.0, 646.0)
+    eq_entries = [e for e in plan if e.get("equation_region") is not None]
+    assert len(eq_entries) == 3  # $$ / formula / $$
+    assert all(e["equation_region"] == (450.0, 129.0, 525.0, 152.0) for e in eq_entries)
+    rot = [e for e in plan if e.get("rotate") == 90]
+    assert len(rot) == 1
+    assert rot[0]["text"] == "Frequency (Hz)"
+    # Wide figure captions are never rotated.
+    assert all(e.get("rotate") != 90 for e in plan if e["text"] == "[t] [a]")
+    assert overflow == 0
+
+
+def test_merge_equation_actual_items_groups_fragments():
+    """Fragments inside an equation bbox merge into one unit; outside items stay."""
+    regions = [(450.0, 128.0, 525.0, 152.0)]
+    items = [
+        {"text": "$$", "x0": 450.0, "y0": 128.9, "x1": 459.7, "y1": 136.8},
+        {"text": "\\mathrm{清浊}", "x0": 450.0, "y0": 136.6, "x1": 505.0, "y1": 144.5},
+        {"text": "$$", "x0": 450.0, "y0": 144.2, "x1": 459.7, "y1": 152.1},
+        {"text": "正文", "x0": 100.0, "y0": 200.0, "x1": 300.0, "y1": 220.0},
+    ]
+    others, units = _merge_equation_actual_items(items, regions)
+    assert [u["text"] for u in units] == ["$$\\mathrm{清浊}$$"]
+    assert [o["text"] for o in others] == ["正文"]
+
+
+def test_merge_expected_equation_units_collapses_region():
+    """Expected-side plan entries of one equation block collapse to one unit."""
+    plan = [
+        {"text": "$$", "y_center_norm": 130.0, "x_center_norm": 480.0, "equation_region": (450.0, 129.0, 525.0, 152.0)},
+        {"text": "\\mathrm{清浊}", "y_center_norm": 140.0, "x_center_norm": 480.0, "equation_region": (450.0, 129.0, 525.0, 152.0)},
+        {"text": "$$", "y_center_norm": 150.0, "x_center_norm": 480.0, "equation_region": (450.0, 129.0, 525.0, 152.0)},
+        {"text": "正文", "y_center_norm": 200.0, "x_center_norm": 300.0},
+    ]
+    units = _merge_expected_equation_units(plan)
+    assert len(units) == 2
+    eq = next(u for u in units if u["text"] == "$$\\mathrm{清浊}$$")
+    assert eq["y_center_norm"] == 140.5
+    assert eq["x_center_norm"] == 487.5

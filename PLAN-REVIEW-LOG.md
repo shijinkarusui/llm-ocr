@@ -326,3 +326,67 @@ Proof re-run by main agent: py_compile OK; pytest 23 passed; smoke OK; `python -
 - `table_cell_gate` best-effort only; external MinerU boxes lack cell metadata.
 - Rotation transform implemented but untested on real rotated pages (source is all rotation=0).
 - Builder subagents have not committed; main agent has not committed — awaiting human sign-off.
+
+### Act 3 — Figure-order + external table gate round (builder subagent, main agent verified)
+- Builder fixes:
+  - `src/make_searchable.py`: new shared layout planner `plan_boxed_lines()` (font scaling / `\n` split / wrap / baseline via real font metrics); `_insert_boxed_lines()` delegates to it; `_page_boxes` preserves `is_table`/`table_cells`.
+  - `src/verify_searchable.py`: expected reading order now uses the line-level planner (not block-level `order`); `_actual_read_order` merges same-line font segments (y-bucket + x adjacency) then center-y/x sort; `_table_cell_gate` gains an external MinerU branch (expected cells from `is_table`/`table_cells`, actual = output PDF text inside table bbox).
+  - `out/build_mineru_boxes.py` (gitignored generator): attaches `is_table` + `table_cells` from MinerU `<td>` markup; regenerated `out/mineru_boxes.json` (37 pages marked as tables).
+  - `tests/test_alignment.py`: +2 tests → **30 passed**.
+- Main-agent independent verification:
+  - 30-page external pilot: zero 30/30, order 30/30, aligned 30/30, coverage 1.0.
+  - Full 303 external pilot: **zero 303/303, order 301/303** (up from 276), aligned 303/303, coverage 1.0; **table_cell_gate computed 37 pages, mean recall 0.9928, mean precision 0.9055**.
+- Remaining known failures (honest, not exempted): page 86 (LaTeX formula block line-splitting) and page 109 (rotated axis label); second builder round in progress.
+
+### Act 3 — Round 2: figure-order fix + external table gate (builder + main-agent verify)
+
+#### Builder round 2 changes (main-agent reviewed; no cheating)
+- `src/make_searchable.py`: new shared layout planner `plan_boxed_lines()` (single source of truth for font scaling / `\n` split / wrapping / baseline via real font metrics `_center_baseline_offset`); `_insert_boxed_lines()` delegates to it; `_page_boxes()` preserves `is_table`/`table_cells`.
+- `src/verify_searchable.py`: expected reading order now uses the writer's line-level plan (not block-level `order`); `_actual_read_order()` merges same-line font segments (y-bucket + x adjacency) then center-y/x sort; `_table_cell_gate()` gains an external MinerU branch (expected cells from `is_table`/`table_cells` markup; actual side = output PDF text inside table bbox).
+- `out/build_mineru_boxes.py`: table blocks now attach `is_table` + `table_cells` (37 pages); regenerated `out/mineru_boxes.json`.
+- Tests: 30 passed (added external table metadata + external table gate tests).
+
+#### Main-agent independent verification
+- `pytest`: 30 passed.
+- 30-page external pilot: zero 30/30, order 30/30, aligned 30/30, coverage 1.0.
+- **Full 303 external pilot**: zero_loss 303/303, aligned 303/303, coverage 1.0, **reading_order 301/303** (was 276/303), **table_cell_gate computed 37 pages, mean cell recall 0.9928 / precision 0.9055** (was not_implemented).
+- Remaining 2 order failures: page 86 (LaTeX formula/array block glyph fragmentation) and page 109 (rotated axis label `Frequency (Hz)`) — second builder round in progress.
+
+### Act 3 — Final round: last two order failures fixed by main agent (no subagents)
+
+#### Root causes
+- **page 86**: was not a formula problem after all — the leftover diff was two
+  wrapped fragments of one Chinese paragraph ("等来表示…" planned y=918.0,
+  "持它的…" planned y=924.67) whose actual physical line order agreed with
+  the plan (yc 918.1 < 924.7), but the verifier sorted the SECONDARY key by
+  x-center. The tail fragment is narrower (same x0, shorter width) so its
+  x-center drifted right and jumped ahead of the preceding fragment.
+- **page 109**: already green from the interrupted round (rotated-axis support).
+
+#### Fixes (main agent)
+- `src/verify_searchable.py` (`_actual_read_order` + `verify_alignment`): the
+  secondary reading-order key is now the left edge x0 (1px grid), not
+  x-center; x-centers remain tie-breaks only. Wrapped fragments of one box
+  share the same x0, so they stay in y order; genuine multi-column splits
+  still separate by x0 gaps; the "：" after "擦音" keeps its position because
+  same-x0 fragments keep y order.
+- `src/make_searchable.py` (`plan_boxed_lines`): plan entries now also carry
+  `x0_norm` for both sides to sort on the same key.
+- Regression test added:
+  `test_actual_read_order_keeps_wrapped_fragments_in_y_order`.
+
+#### Data-builder reproducibility fix
+- New tracked `src/build_mineru_data.py` replaces the gitignored
+  `out/build_mineru_boxes.py` / `out/build_llm_pages.py`: same `block_text`
+  / table-space-join / already-normalized-bbox semantics, plus `is_table` +
+  `table_cells` and `is_equation` markup; CLI `--out-dir`.
+- Verified byte-identical outputs: regenerated `llm_pages.json` and
+  `mineru_boxes.json` into a temp dir compare exactly equal to the current
+  artifacts. Regression test added:
+  `test_build_mineru_data_uses_normalized_bboxes_and_tags`.
+
+#### Final verified numbers (main agent, full 303-page MinerU pilot)
+- **zero_loss 303/303, reading_order 303/303, aligned 303/303**,
+  mean_aligned_coverage=1.0, mean_covered_coverage=1.0.
+- table_cell_gate: computed 37 pages, mean cell recall 0.9928 / precision 0.9055.
+- pytest: **35 passed**.

@@ -142,9 +142,14 @@ def _page_boxes(boxes: Mapping[Any, Any] | None, pno: int) -> list[dict[str, Any
             continue
         item: dict[str, Any] = {"text": text, "box": coords}
         # Preserve plan metadata (mode is the writer/verify routing authority).
+        # is_table/table_cells carry MinerU table markup for the external
+        # table cell gate; is_equation marks formula regions that the verifier
+        # merges into one reading-order unit; the verify report reads them from
+        # these align boxes.
         for key in (
             "source", "mode", "line_id", "column", "cell_row", "cell_col",
             "subline_index", "order", "order_exempt", "header_footer", "align",
+            "is_table", "table_cells", "is_equation",
         ):
             if key in line:
                 item[key] = line[key]
@@ -204,6 +209,29 @@ def _font_width(font_name: str, text: str, fontsize: float) -> float:
     return fitz.Font(fontname=font_name).text_length(text, fontsize=fontsize)
 
 
+def _center_baseline_offset(font_name: str, fontsize: float) -> float:
+    """Baseline offset that puts a glyph's bbox center at the given y.
+
+    PyMuPDF's glyph bbox center sits at ``baseline - (ascender + descender)/2 *
+    fontsize`` (descender is negative). Using real font metrics instead of the
+    old 0.35 heuristic keeps small annotation glyphs (A/B/C/D labels) centered
+    in their boxes, so physical reading order matches box order even when label
+    and caption fonts differ in size.
+    """
+    try:
+        if font_name == "ocripa" and IPA_FONT_PATH.is_file():
+            font = fitz.Font(fontfile=str(IPA_FONT_PATH))
+        elif font_name == "ocrisym" and SEGOE_SYM_FONT_PATH.is_file():
+            font = fitz.Font(fontfile=str(SEGOE_SYM_FONT_PATH))
+        else:
+            font = fitz.Font(fontname=font_name)
+        asc = float(font.ascender or 0.8)
+        desc = float(font.descender or -0.2)
+    except Exception:
+        asc, desc = 0.8, -0.2
+    return (asc + desc) / 2.0 * float(fontsize)
+
+
 def _font_segments(text: str) -> list[tuple[str, str]]:
     """Split a mixed line into font-runnable segments.
 
@@ -248,15 +276,40 @@ def _insert_segmented(
     fontsize: float,
     *,
     align: str = "left",
+    rotate: float = 0.0,
 ) -> None:
     """Insert one logical line as multiple font segments using the layout formula.
 
     ``start_x = anchor + sum(previous segment widths)``; center/right shift the
-    whole line first.
+    whole line first. With ``rotate=90`` the line runs bottom-to-top (the
+    typical orientation of a rotated y-axis label): segments stack upward from
+    ``y_baseline`` at a fixed ``x_anchor``.
     """
     if not text:
         return
     width, segments = _measured_width(text, fontsize)
+    if rotate:
+        cursor_y = y_baseline
+        for font, seg in segments:
+            # Skip whitespace-only segments (e.g. "\n" inside a MinerU block).
+            # PyMuPDF raises on insert_text of an effectively empty string.
+            if not seg.strip():
+                continue
+            if font == "ocripa":
+                page.insert_font(fontname=font, fontfile=str(IPA_FONT_PATH))
+            elif font == "ocrisym":
+                page.insert_font(fontname=font, fontfile=str(SEGOE_SYM_FONT_PATH))
+            page.insert_text(
+                fitz.Point(x_anchor, cursor_y),
+                seg,
+                fontname=font,
+                fontsize=max(0.5, float(fontsize)),
+                rotate=rotate,
+                render_mode=3,
+                overlay=True,
+            )
+            cursor_y -= _font_width(font, seg, fontsize)
+        return
     start = x_anchor
     if align == "center":
         start = x_anchor - width / 2.0
@@ -328,23 +381,52 @@ def _insert_fallback_capacity(page: fitz.Page, text: str, fontsize: float = 8.0)
         _insert_segmented(page, margin_x, y, line, actual_fontsize, align="left")
 
 
-def _insert_boxed_lines(page: fitz.Page, lines: list[dict[str, Any]], overflow_report: dict[str, Any] | None = None) -> None:
-    """Insert aligned geometry lines with height sizing, horizontal alignment,
-    real vertical baseline, wrapping for over-wide lines, and subline distribution.
+def _is_rotated_axis_label(text: str, box_width_norm: float, box_height_norm: float) -> bool:
+    """True for a genuine rotated y-axis label (e.g. ``Frequency (Hz)``).
 
-    PyMuPDF's ``insert_text`` truncates text that extends beyond the physical page
-    edge, so long paragraph-level boxes must be wrapped into several physical
-    lines instead of being inserted as one over-wide string.
+    Criteria are deliberately strict so horizontal figure captions like
+    ``[t] [a]`` (wide box) and vertical CJK side text are never rotated:
+    extremely narrow box (<40 normalized), tall (height > 2x width), short
+    ASCII text without newlines.
     """
-    width, height = page.rect.width, page.rect.height
+    t = text.strip()
+    return bool(
+        t
+        and len(t) >= 6
+        and len(t) <= 60
+        and "\n" not in t
+        and t.isascii()
+        and box_width_norm < 40.0
+        and box_height_norm > 2.0 * box_width_norm
+    )
+
+
+def plan_boxed_lines(
+    lines: list[dict[str, Any]],
+    width: float,
+    height: float,
+) -> tuple[list[dict[str, Any]], int]:
+    """Compute the physical-line placement plan for geometry lines.
+
+    This is the single source of truth for how a boxes-v2 line is laid out
+    (font scaling, wrapping into physical lines, per-line baselines). The writer
+    (``_insert_boxed_lines``) and the verifier's expected reading order both use
+    it, so the gate compares like-for-like: block-level boxes are expanded into
+    the same line-level order the output PDF actually has.
+
+    Returns ``(plan, overflow_count)`` where each plan entry carries the text,
+    insertion coordinates (points), and the normalized center used for reading
+    order.
+    """
+    plan: list[dict[str, Any]] = []
     overflow_count = 0
     for line in lines:
-        x0, y0, x1, y1 = line["box"]
+        x0n, y0n, x1n, y1n = (float(v) for v in line["box"])
         x0, y0, x1, y1 = (
-            x0 * width / 1000.0,
-            y0 * height / 1000.0,
-            x1 * width / 1000.0,
-            y1 * height / 1000.0,
+            x0n * width / 1000.0,
+            y0n * height / 1000.0,
+            x1n * width / 1000.0,
+            y1n * height / 1000.0,
         )
         box_height = max(1.0, y1 - y0)
         box_width = max(1.0, x1 - x0)
@@ -355,35 +437,101 @@ def _insert_boxed_lines(page: fitz.Page, lines: list[dict[str, Any]], overflow_r
             scaled = fontsize * box_width / measured
             fontsize = max(MIN_FONT_PT, scaled)
         align = str(line.get("align", "left"))
+        box_width_norm = x1n - x0n
+        box_height_norm = y1n - y0n
+        region = (x0n, y0n, x1n, y1n) if line.get("is_equation") else None
 
-        # If the line still does not fit after font scaling, wrap it into
-        # multiple physical lines. This keeps zero-loss intact (all chars are
-        # inserted) and prevents PyMuPDF's page-edge truncation.
-        wrapped = [text]
-        if _measured_width(text, fontsize)[0] > box_width:
-            wrapped = []
-            for raw in text.split("\n"):
-                if raw.strip():
-                    wrapped.extend(_wrap_line(raw, fontsize, box_width))
-            if not wrapped:
-                wrapped = [text]
-            if len(wrapped) == 1 and _measured_width(wrapped[0], fontsize)[0] > box_width:
-                overflow_count += 1
-                if overflow_report is not None:
-                    overflow_report["overflow_expected"] = overflow_report.get("overflow_expected", 0) + 1
+        # Genuine rotated y-axis labels: insert the text rotated 90 degrees
+        # bottom-to-top, centered in the tall-narrow box. This prevents the
+        # label from colliding with the horizontal axis label (page 109) and
+        # keeps its physical bbox aligned with the box.
+        if _is_rotated_axis_label(text, box_width_norm, box_height_norm):
+            fontsize = max(1.0, min(box_height * 0.92, box_height * 0.78 + 1.0))
+            fontsize = min(fontsize, box_width * 0.92)
+            rotated_measured, _segments = _measured_width(text, fontsize)
+            if rotated_measured > box_height:
+                fontsize = max(MIN_FONT_PT, fontsize * box_height / rotated_measured)
+            font_name = _font_for_line(text)
+            rotated_width, _segments = _measured_width(text, fontsize)
+            x_center = (x0n + x1n) / 2.0
+            plan.append({
+                "text": text,
+                "x": (x0 + x1) / 2.0 + _center_baseline_offset(font_name, fontsize),
+                "baseline": (y0 + y1) / 2.0 + rotated_width / 2.0,
+                "fontsize": fontsize, "align": align, "rotate": 90,
+                "y_center_norm": (y0n + y1n) / 2.0, "x_center_norm": x_center,
+                "x0_norm": x0n,
+                "equation_region": region,
+            })
+            continue
 
+        # Split on embedded newlines FIRST (MinerU blocks often carry several
+        # logical lines inside one block, e.g. "[i]\n[e]"), then wrap any line
+        # that still does not fit after font scaling. This keeps zero-loss
+        # intact (all chars are inserted) and prevents PyMuPDF's page-edge
+        # truncation; it also makes the planner's line-level order match what
+        # PyMuPDF actually renders for multi-line blocks.
+        logical = [raw for raw in text.split("\n") if raw.strip()]
+        if not logical:
+            logical = [text]
+        wrapped: list[str] = []
+        for raw in logical:
+            if _measured_width(raw, fontsize)[0] > box_width:
+                wrapped.extend(_wrap_line(raw, fontsize, box_width))
+            else:
+                wrapped.append(raw)
+        if len(wrapped) == 1 and _measured_width(wrapped[0], fontsize)[0] > box_width:
+            overflow_count += 1
+
+        x_center_norm = (x0n + x1n) / 2.0
         if len(wrapped) == 1:
-            # Center the glyph vertically inside its box. Using the box top plus
-            # font ascent would pull small (width-scaled) fonts to the very top
-            # of the box and flip physical reading order relative to box order.
-            baseline = (y0 + y1) / 2.0 + fontsize * 0.35
-            _insert_segmented(page, x0, baseline, wrapped[0], fontsize, align=align)
+            # Center the glyph vertically inside its box using real font metrics
+            # (see _center_baseline_offset). This keeps small annotation glyphs
+            # (A/B/C/D labels) at their box centers so the physical reading order
+            # matches the box order even when label and caption font sizes differ.
+            font_name = _font_for_line(wrapped[0])
+            baseline = (y0 + y1) / 2.0 + _center_baseline_offset(font_name, fontsize)
+            plan.append({
+                "text": wrapped[0], "x": x0, "baseline": baseline,
+                "fontsize": fontsize, "align": align,
+                "y_center_norm": (y0n + y1n) / 2.0, "x_center_norm": x_center_norm,
+                "x0_norm": x0n,
+                "equation_region": region,
+            })
         else:
             step = max(1.0, box_height / len(wrapped))
             actual_fontsize = max(1.0, min(fontsize, step * 0.75))
             for i, chunk in enumerate(wrapped):
-                baseline = y0 + (i + 0.5) * step
-                _insert_segmented(page, x0, baseline, chunk, actual_fontsize, align=align)
+                slot_center = y0 + (i + 0.5) * step
+                chunk_font = _font_for_line(chunk)
+                baseline = slot_center + _center_baseline_offset(chunk_font, actual_fontsize)
+                plan.append({
+                    "text": chunk, "x": x0, "baseline": baseline,
+                    "fontsize": actual_fontsize, "align": align,
+                    "y_center_norm": y0n + (i + 0.5) * (max(1.0, (y1n - y0n)) / len(wrapped)),
+                    "x_center_norm": x_center_norm,
+                    "x0_norm": x0n,
+                    "equation_region": region,
+                })
+    return plan, overflow_count
+
+
+def _insert_boxed_lines(page: fitz.Page, lines: list[dict[str, Any]], overflow_report: dict[str, Any] | None = None) -> None:
+    """Insert aligned geometry lines by delegating to the shared layout planner.
+
+    PyMuPDF's ``insert_text`` truncates text that extends beyond the physical page
+    edge, so long paragraph-level boxes must be wrapped into several physical
+    lines instead of being inserted as one over-wide string.
+    """
+    width, height = page.rect.width, page.rect.height
+    plan, overflow_count = plan_boxed_lines(lines, width, height)
+    if overflow_count and overflow_report is not None:
+        overflow_report["overflow_expected"] = overflow_report.get("overflow_expected", 0) + overflow_count
+    for entry in plan:
+        _insert_segmented(
+            page, entry["x"], entry["baseline"], entry["text"], entry["fontsize"],
+            align=entry["align"], rotate=float(entry.get("rotate", 0.0)),
+        )
 
 
 def _metrics_from_lines(
