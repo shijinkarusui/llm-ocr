@@ -17,9 +17,13 @@ def build(notebook: ttk.Notebook, state: State, runner: Runner, log: LogBus) -> 
     pdf_e = ttk.Entry(c)
     dir_e = ttk.Entry(c)
     kw_e = ttk.Entry(c)
+    geo_var = tk.StringVar(value="auto")
+    geo_cb = ttk.Combobox(c, textvariable=geo_var, state="readonly",
+                          values=("auto", "embedded", "external", "fallback_only"))
     kw_e.insert(0, "北京话,同化,韵母")
     row(c, "原 PDF", pdf_e)
     row(c, "OCR 输出目录", dir_e)
+    row(c, "几何源", geo_cb)
     row(c, "验证关键词", kw_e)
     ttk.Label(c, text="输出目录指批量页含 pages/*.md 的目录；关键词用中文逗号分隔。",
               style="PanelHint.TLabel").pack(anchor="w", pady=(6, 0))
@@ -70,7 +74,9 @@ def build(notebook: ttk.Notebook, state: State, runner: Runner, log: LogBus) -> 
             with fitz.open(str(pdf)) as doc:
                 total = doc.page_count
             target = root / "book_searchable.pdf"
-            make_searchable(pdf, list(range(total)), md, None, target)
+            align_out = root / "align"
+            make_searchable(pdf, list(range(total)), md, None, target,
+                            geo_source=geo_var.get(), align_out=align_out)
             res = verify(target, kws) if kws else {}
             return {"pdf": str(target), "bytes": target.stat().st_size, "pages": total,
                     "copyable": (res or {}).get("copyable_chars", "?"),

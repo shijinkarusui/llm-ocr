@@ -12,6 +12,7 @@ a = Analysis(
         'gui_core', 'tab_connect', 'tab_single', 'tab_batch', 'tab_searchable', 'tab_params',
         'llm_client', 'batch_plan', 'ocr_page', 'config', 'check_notation',
         'postprocess', 'make_searchable', 'verify_searchable', 'render',
+        'geom_extract', 'geom_align',
     ],
     hookspath=[], hooksconfig={}, runtime_hooks=[],
     excludes=[

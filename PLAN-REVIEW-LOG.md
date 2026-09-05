@@ -210,3 +210,119 @@ VERDICT: REVISE
   1. 授权继续修正并追加轮次（提高 MAX_ROUNDS）；
   2. 接受当前 R5 剩余问题为已知风险，进入人工签核/实施；
   3. 暂停，先修复其他前置条件（如全量普查/试点）再复审。
+
+## Act 3 — Build
+
+### Round 1 — Builder (DSH subagent_fork)
+状态：成功。Files changed:
+- `src/geom_extract.py` (new)
+- `src/geom_align.py` (new)
+- `src/make_searchable.py`
+- `src/verify_searchable.py`
+- `gui/tab_searchable.py`
+- `llm-ocr-gui.spec`
+- `tests/test_alignment.py` (new)
+
+Builder proof: py_compile OK; pytest 8 passed; tiny smoke passed (summary aligned_pages_ratio=1.0, zero_loss=1, reading_order_ok=1).
+Known deviations reported by builder: cell detection heuristic, rotation transform not fully applied, reading-order conservative, subline partial, 303-page pilot not automated.
+
+### Main agent verdict
+- Proof commands re-run by main agent: py_compile OK; pytest 8 passed; smoke passed.
+- Diff reviewed. Not ready for sign-off due to:
+  1. `verify_alignment` mixed-page reading-order gate is all-or-nothing: `order_exempt` fallback lines should be excluded from reading-order comparison while non-exempt lines remain gated; current code only handles all-exempt pages.
+  2. `header_footer_excluded` mode is defined but never produced by `geom_align.align_page`; header/footer lines are only treated as aligned. Need actual mode/box routing or explicit report semantics.
+  3. External-boxes pages in `make_searchable` get default `aligned_coverage=0.0`/`page_aligned=False` even when external lines are aligned; coverage metrics should be computed from actual page_lines for all modes.
+  4. `verify_alignment` does not implement table cell-level recall/precision gate from the plan; at minimum should surface a computed/placeholder field with clear status.
+- Launching Builder Fix Round 1.
+
+### Build Fix Round 1 — Builder (DSH subagent_fork)
+状态：成功。修复混合页阅读序、header_footer_excluded 生成、external/fallback 指标计算、table_cell_gate 占位。Proof re-run by main agent: py_compile OK; pytest 11 passed; smoke passed（aligned_pages=0 因 smoke 文本被 header/footer 启发式识别为顶部短行）。
+
+### Main agent verdict (Fix Round 1)
+- 主要阻断已修复，但发现新的可实施问题：
+  1. `_is_header_footer` 只凭“顶部/底部 + 短文本”就会把合法短标题/章节题标记为 header_footer_excluded，可能大量压低 aligned_coverage。
+  2. `header_footer_excluded` 行虽然已生成，但 writer 仍与 fallback_capacity 一起走底部 fallback 容量流，未用其真实几何框位置；与“写入专属 header/footer 几何框”的 plan 不一致。
+- 进入 Builder Fix Round 2。
+
+### Build Fix Round 2 — Builder (DSH subagent_fork)
+状态：成功。
+- `src/geom_extract.py`：收紧 header/footer 检测（位置 + 页码/页脚正则或显式锚点，不再仅凭短文本）；修复 bbox 解包 bug。
+- `src/make_searchable.py`：新增 `_partition_lines()`，header_footer_excluded 行走真实几何框写入，不再与 fallback 一起沉底。
+- `tests/test_alignment.py`：新增/更新至 16 个测试。
+Proof re-run by main agent: py_compile OK; pytest 16 passed; smoke OK（aligned_pages=1, reading_order_ok=1, zero_loss=1）。
+
+### Main agent final build verdict
+- 核心实现与两轮修复均通过独立 proof。
+- 已知剩余项（非阻塞，作为后续数据驱动/完善任务）：
+  - 跨页重复页眉（无页码）默认不排除，待跨页 pass；
+  - `table_cell_gate` 为显式 `not_implemented`/`best_effort_pending` 占位，需真实表 10-3 golden 标定；
+  - 旋转页坐标变换未完整实现（当前源 PDF 全部 rotation=0，非阻塞）；
+  - 303 页普查/30 页试点尚未执行，属于数据运行任务。
+- Builder 未 commit；主代理未 commit。等待人工签核后由主代理提交。
+
+## Act 3 — Remaining Items Build (user authorized continue)
+
+### Builder (DSH subagent_fork)
+状态：成功。Files changed:
+- `src/geom_extract.py`：实现 cropbox+rotation_matrix 坐标变换；跨页重复页眉/页脚锚点扫描与 `known_header_anchors` 传递。
+- `src/make_searchable.py`：embedded/auto 路径按请求页范围缓存跨页页眉锚点并传给提取器。
+- `src/verify_searchable.py`：`_table_cell_gate` 由占位改为 best-effort computed（解析 md 表格 + cell_row/cell_col 元数据，输出 recall/precision）。
+- `src/pilot_alignment.py`（新）：pilot/census CLI 入口，支持 `--pages/--align-out/--out-pdf/--census-only`。
+- `tests/test_alignment.py`：增至 23 个测试。
+
+Proof re-run by main agent: py_compile OK; pytest 23 passed; smoke OK; `python -m src.pilot_alignment --help` OK.
+
+### Main agent final status
+- 代码级剩余项已完成：旋转/裁剪坐标变换、跨页页眉、表格 cell best-effort gate、pilot/census 入口。
+- 数据级任务尚未执行：真实 30 页 pilot / 303 页 census 需要 `pages/page_*.md` 或等价 page-level md 输入；当前仓库未发现 per-page MD。
+- 不再自动扩展；等待人工签核决定提交与后续数据运行。
+
+## Act 3 — Data / Pilot Run (user authorized continue; main agent fixes + data runs)
+
+### Main agent found and fixed pilot issues
+1. **子集 pilot 页码映射 bug**：`verify_alignment` 按输出页序号查 md/boxes，subset（如原页20）查不到。新增 `page_numbers` 参数，pilot 传入原页码。
+2. **CJK 标点/符号被 Arial 写成 NUL/软连字符**：`_font_segments` 改为按字符路由——IPA/modifier → Arial，其余非 ASCII → china-s，ASCII → helv；ASCII `-` 不再被 Arial 误转。
+3. **`_filter_exempt_actual` 误删包含页脚印号的行**：若 exempt chunk 只是真实行子串（如 `"1"`），不再整行删除，只删除完整包含于 exempt chunk 的实际行。
+4. **`order` 排序键从 top-y 改为 center-y**：与输出 PDF 实际 reading-order 推导一致，修复封面/目录/大图页的局部倒序。
+
+### Real pilot results
+- **真实单页 pilot**（原页20，使用 `tests/page21_llm.md` 高保真 MD）：
+  - `zero_loss=1`，`reading_order_ok=1`，`covered_coverage=1.0`；
+  - `aligned_coverage=0.028`：该页 LLM md 与内嵌 OCR 文本差异大，大部分行走 fallback 容量流，属预期。
+- **30 页替身 pilot**（0–29，使用 PDF 内嵌文本作临时 page-level md）：
+  - `zero_loss_pages=30/30`，`reading_order_ok_pages=29/30`，`aligned_pages=30/30`，`mean_aligned_coverage=0.9908`，`mean_covered_coverage=1.0`；
+  - 唯一阅读序失败页（原页 28）是大图/标注页两条几乎同行标注（`顺点运动疗问` vs `————→水波运动方向`）的歧义排序，需要更精细的图区/列排序或人工 golden。
+  - `table_cell_gate` 在 1 页上 computed 但 recall/precision 为 0，真实表 10-3 golden 仍需数据标定。
+- 已新增回归测试至 **26 passed**（font routing、filter exempt、page_numbers subset、现有全部）。
+
+### Current data limitation
+- 真实 30 页/303 页高保真 pilot 仍需 `pages/page_*.md` 或 LLM API 生成 per-page md；当前没有 API key 且仓库无 per-page md 全集。`src/pilot_alignment.py` 已可执行替代跑法。
+
+### Act 3 — MinerU data + full pilot run (main agent, continued)
+
+#### New data artifacts (from MinerU content_list, all 303 pages)
+- `out/llm_pages.json` — per-page high-fidelity Markdown built from `content_list` blocks (`build_llm_pages.py`); table cells joined with spaces (not `|`) so the text layer matches what the writer inserts.
+- `out/mineru_boxes.json` — external geometric boxes for all 303 pages (`build_mineru_boxes.py`, 2576 lines): MinerU `content_list` bbox is already normalized 0–1000 (must NOT be re-divided by page size); table text uses space-joined cells.
+- `out/census303/census_report.json` — 303-page embedded-geometry census (mean aligned coverage 0.0997; embedded OCR text is far from MinerU MD, as expected).
+
+#### Code fixes found by the real-data run
+1. **IPA/Latin font routing** (`make_searchable.py`): Arial maps schwa `ə`→Cyrillic `ә`; Segoe UI (`segoeui.ttf`) preserves IPA exactly. Added `IPA_FONT_PATH=segoeui.ttf` and expanded `IPA_RE` to Latin-1/Latin-Extended/Greek (`æ ç ŋ ² ¬ …`). Added `SEGOE_SYM_FONT_PATH=seguisym.ttf` + `SYMBOL_RE` (Latin-1 punctuation, quotes/daggers/ellipsis, super/subscripts, arrows, math operators, dingbats) routed to `ocrisym`; china-s keeps CJK/punctuation/symbols it renders correctly.
+2. **Long-line truncation** (`_insert_boxed_lines`): PyMuPDF `insert_text` truncates text that overruns the page edge; paragraph-level MinerU boxes are now wrapped into multiple physical lines inside the box (using `_wrap_line`), and baselines are centered in the box (`center + fontsize*0.35`) instead of pinned to box top — this fixes physical reading order vs box order.
+3. **Exempt-text filtering** (`verify_searchable._filter_exempt_actual`): keep actual lines that textually match a non-exempt line before applying fallback/header-footer removal; short real lines like a standalone `图` are no longer deleted just because they are substrings of fallback text.
+4. **Markdown normalization** (`geom_align.normalize_md`): `[ɛ]([E])`-style literal TOC text is no longer stripped as a Markdown link (link target must be bracket-free); `|`/`||` used as metrical/phonology notation is preserved, only real table rows (single leading+trailing pipe, ≥2 pipes) are collapsed.
+5. **Pilot CLI** (`pilot_alignment.py`): new `--boxes-json` to inject external MinerU boxes (`geo_source=external`).
+
+#### Pilot results (source PDF 303 pages, MinerU MD + external boxes)
+- 30-page external pilot: `zero_loss=30/30`, `reading_order=30/30`, `aligned=30/30`, `mean_aligned_coverage=1.0`.
+- **Full 303-page external pilot** (`out/pilot_mineru303/`):
+  - `zero_loss_pages=303/303`
+  - `aligned_pages=303/303`, `mean_aligned_coverage=1.0`, `mean_covered_coverage=1.0`
+  - `reading_order_ok=276/303` — remaining 27 pages are figure-annotation ordering ambiguity (A/B/C/D labels around captions, e.g. pages 40, 44, 100, 302), the same class of limitation already documented for the stand-in pilot; not a text loss.
+  - `table_cell_gate`: `not_implemented` on the external path because MinerU box lines carry no cell_row/cell_col metadata; embedded-path best-effort gate remains.
+- Tests: **28 passed** (added font-routing and literal-pipe regression tests).
+
+#### Final known limitations (non-blocking)
+- 27/303 reading-order fails are figure-label ambiguity; would need figure-region-specific ordering rules or a golden set to resolve.
+- `table_cell_gate` best-effort only; external MinerU boxes lack cell metadata.
+- Rotation transform implemented but untested on real rotated pages (source is all rotation=0).
+- Builder subagents have not committed; main agent has not committed — awaiting human sign-off.
