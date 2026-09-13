@@ -51,9 +51,29 @@ DEFAULT_ENDPOINT_PATH = "/v1/chat/completions"
 TIMEOUT = 90
 POST_TIMEOUT = 90
 GET_TIMEOUT = 15
-# W0: 默认长度 100000 -> 8192 (chat max_tokens / responses max_output_tokens; anthropic 4096不动)
-MAX_TOKENS = 8192
-MAX_OUTPUT_TOKENS = 8192
+# Default output-length ceiling.  Reasoning models (Muse 1.2/1.3) spend
+# thousands of tokens thinking before emitting any text, so a small cap
+# truncates the answer: the Responses API reports status=incomplete with an
+# empty output array.  20000 leaves room for thinking plus a full OCR page.
+MAX_TOKENS = 20000
+MAX_OUTPUT_TOKENS = 20000
+
+# Output-length control is spelled differently per endpoint: chat/completions
+# takes max_tokens (or max_completion_tokens) while the Responses API takes
+# max_output_tokens.  A caller may pass any of the three; the client
+# normalises to the spelling the target endpoint understands, so one body
+# never carries two competing limits.
+_LENGTH_KEYS = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+_CHAT_LENGTH_PRIORITY = ("max_tokens", "max_completion_tokens", "max_output_tokens")
+_RESPONSES_LENGTH_PRIORITY = ("max_output_tokens", "max_tokens", "max_completion_tokens")
+_REASONING_EFFORT_KEYS = ("reasoning_effort", "reasoningEffort")
+
+# Thinking level sent when the caller does not pick one.  Muse 1.2/1.3 default
+# to a very high effort server-side, which can spend the entire output budget
+# on reasoning tokens and leave the response empty (status=incomplete,
+# output=[]).  "medium" is ample for OCR.  Override with
+# LLM_OCR_REASONING_EFFORT; an empty value means "send no reasoning control".
+DEFAULT_REASONING_EFFORT = os.environ.get("LLM_OCR_REASONING_EFFORT", "medium").strip()
 RETRY_AFTER_CAP = 60
 
 
@@ -227,6 +247,77 @@ def _merge_body_kwargs(body: dict[str, Any], kwargs: dict[str, Any]) -> None:
                 raise ValueError(f"extra_json is not valid JSON: {v[:200]}")
             continue
         body[k] = v
+
+
+def _coalesce_length(
+    body: dict[str, Any],
+    priority: tuple[str, ...],
+    key: str,
+    default: int,
+) -> None:
+    """Reduce every output-length spelling to the one this endpoint takes.
+
+    ``priority`` lists the accepted spellings in preference order, so a caller
+    that passed ``max_output_tokens`` to the chat endpoint still has the value
+    honoured -- merely renamed -- instead of ending up beside the default
+    ``max_tokens`` and sending two conflicting limits.
+    """
+    value: Any = None
+    for name in priority:
+        if body.get(name) is not None:
+            value = body[name]
+            break
+    for name in _LENGTH_KEYS:
+        body.pop(name, None)
+    body[key] = value if value is not None else default
+
+
+def _coalesce_reasoning_effort(body: dict[str, Any], *, responses_style: bool) -> None:
+    """Normalise thinking-effort control and never forward a blank value.
+
+    chat/completions uses a flat ``reasoning_effort``; the Responses API nests
+    it as ``reasoning: {"effort": ...}``.  An empty string is not a valid level,
+    so it is dropped rather than sent.
+    """
+    effort: Any = None
+    explicit_blank = False
+    for name in _REASONING_EFFORT_KEYS:
+        raw = body.pop(name, None)
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if raw:
+                effort = raw
+            else:
+                explicit_blank = True
+        elif raw is not None:
+            effort = raw
+
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        nested = reasoning.get("effort")
+        if isinstance(nested, str) and not nested.strip():
+            reasoning.pop("effort", None)
+            explicit_blank = True
+        elif nested and effort is None:
+            effort = nested
+    elif reasoning is not None:
+        body.pop("reasoning", None)
+
+    if effort is None:
+        if explicit_blank:
+            return
+        effort = DEFAULT_REASONING_EFFORT
+    if not effort:
+        return
+    if responses_style:
+        nested = body.get("reasoning")
+        if not isinstance(nested, dict):
+            nested = {}
+            body["reasoning"] = nested
+        nested["effort"] = effort
+    else:
+        body.pop("reasoning", None)
+        body["reasoning_effort"] = effort
 
 
 def _http_hint(status: int | None, payload: Any, base_url: str, api_path: str) -> str:
@@ -491,12 +582,11 @@ def chat_completions(
     Returns (text, usage, raw_payload).
     """
     body: dict[str, Any] = {"model": _model(model), "messages": messages}
-    # default only if caller didn't specify either length control
-    if "max_tokens" not in kwargs and "max_completion_tokens" not in kwargs and "max_tokens" not in body and "max_completion_tokens" not in body:
-        body["max_tokens"] = MAX_TOKENS
     if "temperature" not in kwargs and "temperature" not in body:
         body["temperature"] = 0
     _merge_body_kwargs(body, kwargs)
+    _coalesce_length(body, _CHAT_LENGTH_PRIORITY, "max_tokens", MAX_TOKENS)
+    _coalesce_reasoning_effort(body, responses_style=False)
     payload, usage = generic_request(body, endpoint=ENDPOINT_CHAT, base_url=base_url, api_key=api_key, attempts=attempts, timeout=timeout)
     text = _extract_chat_content(payload)
     return text, usage, payload
@@ -635,10 +725,9 @@ def responses_create(
         raise TypeError("input must be str or list[dict]")
     if instructions is not None:
         body["instructions"] = instructions
-    # default length control for responses if not specified
-    if "max_output_tokens" not in kwargs and "max_output_tokens" not in body and "max_tokens" not in kwargs:
-        body["max_output_tokens"] = MAX_OUTPUT_TOKENS
     _merge_body_kwargs(body, kwargs)
+    _coalesce_length(body, _RESPONSES_LENGTH_PRIORITY, "max_output_tokens", MAX_OUTPUT_TOKENS)
+    _coalesce_reasoning_effort(body, responses_style=True)
     payload, usage = generic_request(body, endpoint=ENDPOINT_RESPONSES, base_url=base_url, api_key=api_key, attempts=attempts, timeout=timeout)
     text = _extract_responses_text(payload)
     # if extraction failed, try to dump payload for debugging but return empty string
