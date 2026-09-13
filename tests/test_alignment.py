@@ -18,7 +18,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from make_searchable import _font_for_char, _font_segments, _page_boxes, _usable_boxes, _fallback_only_lines, _metrics_from_lines, _partition_lines, make_searchable, plan_boxed_lines
+from make_searchable import _font_for_char, _font_segments, _page_boxes, _usable_boxes, _fallback_only_lines, _metrics_from_lines, _partition_lines, _table_cell_lines, make_searchable, plan_boxed_lines
 from verify_searchable import _actual_read_order, _filter_exempt_actual, _merge_equation_actual_items, _merge_expected_equation_units, _table_cell_gate, garble_ratio, verify_alignment
 from geom_align import align_page, normalize_md
 from geom_extract import _is_header_footer, _is_page_like, extract_lines, extract_repeated_header_anchors, repeated_anchors_from_candidate_sets
@@ -501,6 +501,40 @@ def test_build_mineru_data_uses_normalized_bboxes_and_tags(tmp_path, monkeypatch
     table = next(ln for ln in lines.values() if ln.get("is_table"))
     assert table["table_cells"] == ["a", "b"]
     assert "a b" in md_out["0"]
+
+
+def test_expand_table_grid_honors_rowspan_colspan_and_th():
+    """Hidden span markup must expand to a full grid: colspan repeats the
+    label, rowspan carries into rows below, <th> parses as a cell."""
+    import build_mineru_data as bmd
+
+    h = (
+        "<table><tr><td colspan=\"2\">A B</td><th>C</th></tr>"
+        "<tr><td rowspan=\"2\">R</td><td>x</td><td>y</td></tr>"
+        "<tr><td>p</td><td>q</td></tr></table>"
+    )
+    assert bmd.has_hidden_span_markup(h) is True
+    assert bmd.has_hidden_span_markup("<tr><td>a</td></tr>") is False
+    assert bmd.expand_table_grid(h) == [
+        ["A B", "A B", "C"],
+        ["R", "x", "y"],
+        ["R", "p", "q"],
+    ]
+
+
+def test_table_cell_lines_rejects_bad_span_expansion():
+    """A span-marked table whose stored grid is narrower than the raw HTML's
+    spanned width must fall back (None), never map cells onto wrong columns."""
+    line = {
+        "text": "A B C",
+        "box": [0, 0, 1000, 400],
+        "line_id": "M00000000",
+        "is_table": True,
+        "table_span_markup": True,
+        "table_raw_html": "<tr><td colspan=\"3\">A B C</td></tr>",
+        "table_grid": [["A B C"]],
+    }
+    assert _table_cell_lines(line, []) is None
 
 
 def test_pilot_parse_pages():

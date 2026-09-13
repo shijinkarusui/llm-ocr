@@ -36,6 +36,12 @@ ROW_TOL = 12.0
 # same column band are stacked fragments of one logical line, so they keep
 # top-to-bottom order instead of being x-sorted (page 86's wrapped "擦音：").
 COL_TOL = 20.0
+# Geometric gate: an inserted line's y-center must sit within this distance
+# (0-1000 normalized ≈ 10 pt) of its source box's y-center. Row-refined lines
+# carry their true row box, so a block-slot drift like the old page-80 layout
+# (fragments centered in a 130-unit block box) fails loudly instead of being
+# masked by the character-count gates.
+GEO_TOL = 16.0
 
 _BAD_CHAR_RE = re.compile(r"[?\ufffd]")
 _SUSPICIOUS_TOKEN_RE = re.compile(
@@ -513,6 +519,90 @@ def _actual_read_order(
     return _canonical("".join(it["text"] for it in grouped)), grouped
 
 
+def _geometric_gate(
+    actual_items: list[dict[str, Any]],
+    expected_lines: list[dict[str, Any]],
+    *,
+    tol: float = GEO_TOL,
+) -> dict[str, Any]:
+    """Per-line geometric check: does each inserted line sit on its source box?
+
+    For every non-exempt expected line with a real box, find the actual output
+    item with the best canonical-text overlap and compare y-centers. A line
+    passes when ``|actual_y - expected_y| <= tol`` (0-1000 units). Equation
+    units, order-exempt lines, and rotated labels are skipped (the verifier
+    merges/relocates them by design). Returns counts plus the worst offenders
+    so a page-80-style drift is diagnosable, not just a boolean.
+    """
+    checked = 0
+    passed = 0
+    worst: list[dict[str, Any]] = []
+    for exp in expected_lines:
+        if exp.get("order_exempt") or exp.get("is_equation"):
+            continue
+        box = exp.get("box")
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        exp_c = _canonical(str(exp.get("text", "")))
+        if not exp_c:
+            continue
+        try:
+            ey = (float(box[1]) + float(box[3])) / 2.0
+        except (TypeError, ValueError):
+            continue
+        best: dict[str, Any] | None = None
+        best_score = 0.0
+        for it in actual_items:
+            act_c = _canonical(str(it.get("text", "")))
+            if not act_c:
+                continue
+            # Positional pre-filter: the actual item must vertically overlap
+            # the expected box (expanded by 2x tol). Duplicate texts (``塞音``
+            # on two sub-rows; ``不送气`` in the 塞音 and 塞擦音 blocks) then
+            # match their OWN row's occurrence instead of the first one
+            # anywhere on the page — the old text-only match compared the
+            # header copy against the wrong row and reported phantom drift.
+            try:
+                ay0 = float(it["y0"]) / 10.0
+                ay1 = float(it["y1"]) / 10.0
+            except (TypeError, ValueError, KeyError):
+                continue
+            if ay1 < ey - 2 * tol or ay0 > ey + 2 * tol:
+                continue
+            if act_c == exp_c:
+                score = 1.0
+            elif exp_c in act_c or act_c in exp_c:
+                score = min(len(exp_c), len(act_c)) / max(len(exp_c), len(act_c))
+            else:
+                score = difflib.SequenceMatcher(None, exp_c, act_c).ratio()
+            if score > best_score:
+                best_score = score
+                best = it
+        if best is None or best_score < 0.5:
+            continue
+        checked += 1
+        ay = (float(best["y0"]) + float(best["y1"])) / 2.0
+        dev = abs(ay - ey)
+        if dev <= tol:
+            passed += 1
+        else:
+            worst.append({
+                "expected": exp_c[:40],
+                "dev": round(dev, 2),
+                "expected_y": round(ey, 1),
+                "actual_y": round(ay, 1),
+            })
+    worst.sort(key=lambda w: -w["dev"])
+    ratio = (passed / checked) if checked else 1.0
+    return {
+        "checked": checked,
+        "passed": passed,
+        "pass_ratio": ratio,
+        "ok": ratio >= 0.9,
+        "worst": worst[:5],
+    }
+
+
 def verify_alignment(
     out_pdf: str | Path,
     md_dict: dict[str, Any],
@@ -631,6 +721,14 @@ def verify_alignment(
                 expected_raw,
                 actual_items,
             )
+            # Geometric gate: inserted lines must sit on their source boxes
+            # (catches page-80-style slot drift that char-count gates mask).
+            # The equation path merges fragments into region units, which have
+            # no 1:1 line counterpart, so the gate is skipped there.
+            if equation_regions:
+                geometric_gate = {"checked": 0, "passed": 0, "pass_ratio": 1.0, "ok": True, "worst": [], "note": "skipped: equation units merged"}
+            else:
+                geometric_gate = _geometric_gate(actual_items, non_exempt_lines)
             page_results.append({
                 "page_index": orig_pno,
                 "output_page_index": pno,
@@ -645,15 +743,22 @@ def verify_alignment(
                 "page_aligned": bool(align_page.get("page_aligned", False)),
                 "table_unreliable": bool(align_page.get("table_unreliable", False)),
                 "table_cell_gate": table_cell_gate,
+                "geometric_gate": geometric_gate,
                 "failure_reasons": align_page.get("failure_reasons", {}),
             })
 
     page_count = len(page_results)
+    geo_checked = [r for r in page_results if r["geometric_gate"].get("checked")]
     summary = {
         "pages_total": page_count,
         "zero_loss_pages": total_zero_pass,
         "reading_order_checked_pages": sum(1 for r in page_results if r["reading_order_ok"] is not None),
         "reading_order_ok_pages": total_order_pass,
+        "geometric_ok_pages": sum(1 for r in page_results if r["geometric_gate"].get("ok")),
+        "mean_geometric_pass_ratio": (
+            sum(r["geometric_gate"]["pass_ratio"] for r in geo_checked) / len(geo_checked)
+        ) if geo_checked else 1.0,
+        "geometric_fail_pages": [r["page_index"] for r in page_results if not r["geometric_gate"].get("ok")],
         "aligned_pages": total_aligned_pages,
         "aligned_pages_ratio": (total_aligned_pages / page_count) if page_count else 0.0,
         "mean_aligned_coverage": (sum_aligned / page_count) if page_count else 0.0,
