@@ -19,6 +19,7 @@ interface SessionState {
   dpi: number;
   retries: number;
   extraText: string;
+  ocrPrompt: string;
   view: ViewId;
   dark: boolean;
   set: (p: Partial<SessionState>) => void;
@@ -35,6 +36,7 @@ export const useSession = create<SessionState>((set) => ({
   dpi: 200,
   retries: 2,
   extraText: DEFAULT_EXTRA,
+  ocrPrompt: "",
   view: "connect",
   dark: false,
   set: (p) => set(p),

@@ -107,7 +107,7 @@ export function BatchView() {
           endpoint: s.endpoint, detail: s.detail, timeout: s.timeout,
         },
         pdf.trim(), outdir.trim() || "out/book_gui", start, end,
-        s.dpi, s.concurrency, s.retries, extra,
+        s.dpi, s.concurrency, s.retries, extra, s.ocrPrompt,
       );
       setJobId(r.job_id);
       stopPoll();
@@ -162,6 +162,11 @@ export function BatchView() {
               全书 {dry.total_pages} 页，本次计划 {dry.planned_pages} 页
             </p>
           )}
+          <p className="text-xs leading-5 text-muted-foreground" role="status">
+            {s.ocrPrompt.trim()
+              ? `使用自定义提示词（${s.ocrPrompt.length} 字，在「参数」页编辑）`
+              : "使用默认提示词（可在「参数」页自定义）"}
+          </p>
         </CardContent>
         <CardFooter>
           <Button variant="outline" onClick={doDry} disabled={phase === "loading" || phase === "running"}>

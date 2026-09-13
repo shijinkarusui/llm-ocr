@@ -51,28 +51,38 @@ export function probe(p: LlmParams): Promise<ProbeRes> {
 }
 
 export interface OcrRes { markdown: string; png_b64_preview?: string }
-export function ocrImage(p: LlmParams, pngB64: string): Promise<OcrRes> {
+
+/** Only send a prompt when the user actually customised one: an empty editor
+ *  must fall back to the server's prompts/ocr_system.md, not blank it out. */
+function promptField(prompt?: string): Record<string, string> {
+  const v = (prompt ?? "").trim();
+  return v ? { prompt: v } : {};
+}
+
+export function ocrImage(p: LlmParams, pngB64: string, prompt?: string): Promise<OcrRes> {
   return req<OcrRes>("/api/ocr/image", {
     method: "POST",
     body: JSON.stringify({
       base_url: p.baseUrl, model: p.model, key: p.key,
       endpoint: p.endpoint, detail: p.detail, timeout: p.timeout, png_b64: pngB64,
+      ...promptField(prompt),
     }),
   });
 }
 
-export function ocrUrl(p: LlmParams, imageUrl: string): Promise<OcrRes> {
+export function ocrUrl(p: LlmParams, imageUrl: string, prompt?: string): Promise<OcrRes> {
   return req<OcrRes>("/api/ocr/url", {
     method: "POST",
     body: JSON.stringify({
       base_url: p.baseUrl, model: p.model, key: p.key,
       endpoint: p.endpoint, detail: p.detail, timeout: p.timeout, image_url: imageUrl,
+      ...promptField(prompt),
     }),
   });
 }
 
 export function ocrPdfPage(
-  p: LlmParams, pdfPath: string, pno: number, dpi: number,
+  p: LlmParams, pdfPath: string, pno: number, dpi: number, prompt?: string,
 ): Promise<OcrRes> {
   return req<OcrRes>("/api/ocr/pdf-page", {
     method: "POST",
@@ -80,6 +90,7 @@ export function ocrPdfPage(
       base_url: p.baseUrl, model: p.model, key: p.key,
       endpoint: p.endpoint, detail: p.detail, timeout: p.timeout,
       pdf_path: pdfPath, pno, dpi,
+      ...promptField(prompt),
     }),
   });
 }
@@ -100,6 +111,7 @@ export interface BatchRunRes { job_id: string }
 export function batchRun(
   p: LlmParams, pdfPath: string, outdir: string, start: number, end: number | undefined,
   dpi: number, concurrency: number, retries: number, extra: Record<string, unknown>,
+  prompt?: string,
 ): Promise<BatchRunRes> {
   return req<BatchRunRes>("/api/batch/run", {
     method: "POST",
@@ -108,6 +120,7 @@ export function batchRun(
       endpoint: p.endpoint, detail: p.detail, timeout: p.timeout,
       pdf_path: pdfPath, outdir, start, end: end ?? null,
       dpi, concurrency, retries, extra,
+      ...promptField(prompt),
     }),
   });
 }

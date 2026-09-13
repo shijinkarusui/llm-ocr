@@ -155,6 +155,17 @@ def _norm_ep(ep: str | None) -> str:
     return e
 
 
+def _resolve_prompt(prompt: str | None) -> str:
+    """A caller-supplied prompt wins; otherwise fall back to prompts/ocr_system.md.
+
+    PROMPT_PATH stays a module global so serve.py can repoint it at the bundled
+    resource; this helper only decides between an explicit override and that file.
+    """
+    if prompt is not None and prompt.strip():
+        return prompt
+    return PROMPT_PATH.read_text(encoding="utf-8")
+
+
 def ocr_image(
     png_bytes: bytes,
     *,
@@ -166,8 +177,9 @@ def ocr_image(
     system: str | None = None,
     extra: dict | None = None,
     timeout: int | None = None,
+    prompt: str | None = None,
 ) -> str:
-    prompt = PROMPT_PATH.read_text(encoding="utf-8")
+    prompt = _resolve_prompt(prompt)
     extra = extra or {}
     base_url, model, api_key, endpoint, detail = _resolve_ocr(base_url=base_url, model=model, api_key=api_key, endpoint=endpoint, detail=detail, system=system)
     if timeout is not None:
@@ -204,8 +216,9 @@ def ocr_image_url(
     system: str | None = None,
     extra: dict | None = None,
     timeout: int | None = None,
+    prompt: str | None = None,
 ) -> str:
-    prompt = PROMPT_PATH.read_text(encoding="utf-8")
+    prompt = _resolve_prompt(prompt)
     extra = extra or {}
     base_url, model, api_key, endpoint, detail = _resolve_ocr(base_url=base_url, model=model, api_key=api_key, endpoint=endpoint, detail=detail, system=system)
     if timeout is not None:
@@ -243,9 +256,10 @@ def ocr_pdf_page(
     extra: dict | None = None,
     dpi: int = 200,
     timeout: int | None = None,
+    prompt: str | None = None,
 ) -> str:
     png, _dpi_actual, _o, _f = _ladder_or_direct(pdf_path, pno, dpi)
-    return ocr_image(png, base_url=base_url, model=model, api_key=api_key, endpoint=endpoint, detail=detail, system=system, extra=extra, timeout=timeout)
+    return ocr_image(png, base_url=base_url, model=model, api_key=api_key, endpoint=endpoint, detail=detail, system=system, extra=extra, timeout=timeout, prompt=prompt)
 
 
 def main() -> int:
@@ -264,6 +278,8 @@ def main() -> int:
     parser.add_argument("--detail", type=str, default="high", help="Image detail: high|low|auto (default high, recommended for IPA)")
     parser.add_argument("--system", type=str, default=None, help="System prompt override (Anthropic 'system'); for chat/responses it merges as extra.system if needed")
     parser.add_argument("--extra-json", type=str, default=None, help='JSON object merged into request body, e.g. \'{"temperature":0.2,"reasoning_effort":"low","max_output_tokens":20000}\'')
+    parser.add_argument("--prompt-file", type=pathlib.Path, default=None, help="Override prompts/ocr_system.md with this file's text")
+    parser.add_argument("--prompt-text", type=str, default=None, help="Override the OCR prompt with this literal text")
     args = parser.parse_args()
 
     extra = _parse_extra(args.extra_json)
@@ -273,11 +289,17 @@ def main() -> int:
     else:
         extra_system = None
 
+    custom_prompt = args.prompt_text
+    if custom_prompt is None and args.prompt_file is not None:
+        custom_prompt = args.prompt_file.read_text(encoding="utf-8")
+
     # for anthropic, system should be passed as the dedicated param not just extra
     def _ocr_kwargs(ep: str) -> dict:
         kw: dict = {"base_url": args.base_url, "model": args.model, "api_key": args.api_key, "endpoint": ep, "detail": args.detail, "extra": extra}
         if ep.lower() in ("messages", "anthropic") and args.system:
             kw["system"] = args.system
+        if custom_prompt is not None:
+            kw["prompt"] = custom_prompt
         return kw
 
     if args.image is not None:

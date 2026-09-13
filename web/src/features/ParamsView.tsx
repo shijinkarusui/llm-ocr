@@ -7,6 +7,7 @@ import { useSession, type Detail, type Endpoint } from "@/stores/session";
 import { useLog } from "@/stores/log";
 import { parseExtra } from "@/lib/utils";
 import { NotationCard } from "@/features/NotationCard";
+import { PromptCard } from "@/features/PromptCard";
 
 function RadioRow<T extends string>({
   name,
@@ -149,6 +150,7 @@ export function ParamsView() {
           <Button onClick={apply}>应用参数</Button>
         </CardFooter>
       </Card>
+      <PromptCard />
       <NotationCard />
     </div>
   );

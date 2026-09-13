@@ -98,6 +98,16 @@ def _llm_kwargs(data):
     }, extra
 
 
+def _request_prompt(data):
+    """Optional caller-supplied OCR prompt; None means use prompts/ocr_system.md."""
+    prompt = data.get("prompt")
+    if prompt is None:
+        return None
+    if not isinstance(prompt, str):
+        raise ValueError("prompt must be a string")
+    return prompt if prompt.strip() else None
+
+
 def _progress_from_usage(outdir):
     """Read usage.jsonl: success pages / tokens / durations summary."""
     from collections import Counter
@@ -147,7 +157,7 @@ def _job_cancelled(jid):
         return bool((JOBS.get(jid) or {}).get("cancel"))
 
 
-def _run_batch_job(jid, pdf_path, outdir, kw):
+def _run_batch_job(jid, pdf_path, outdir, kw, cleanup=None):
     from batch_plan import run_batch
     _job_set(jid, status="running")
     try:
@@ -159,6 +169,12 @@ def _run_batch_job(jid, pdf_path, outdir, kw):
     except Exception as exc:  # noqa: BLE001 - surfaced via job polling
         _job_set(jid, status="error", error="%s: %s" % (type(exc).__name__, exc))
         log("batch job %s error %s" % (jid, exc))
+    finally:
+        if cleanup:
+            try:
+                Path(cleanup).unlink()
+            except OSError:
+                pass
 
 
 def _run_searchable_job(jid, pdf_path, outdir, geo_source, keywords):
@@ -347,7 +363,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         text = ocr_image(png, base_url=llm["base_url"], model=llm["model"],
                          api_key=llm["api_key"], endpoint=data.get("endpoint") or "responses",
-                         detail=llm["detail"], extra=extra, timeout=data.get("timeout"))
+                         detail=llm["detail"], extra=extra, timeout=data.get("timeout"),
+                         prompt=_request_prompt(data))
         self._send(200, {"markdown": text})
 
     def _handle_ocr_url(self, data):
@@ -360,7 +377,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         text = ocr_image_url(url, base_url=llm["base_url"], model=llm["model"],
                              api_key=llm["api_key"], endpoint=data.get("endpoint") or "responses",
-                             detail=llm["detail"], extra=extra, timeout=data.get("timeout"))
+                             detail=llm["detail"], extra=extra, timeout=data.get("timeout"),
+                             prompt=_request_prompt(data))
         self._send(200, {"markdown": text})
 
     def _handle_ocr_pdf_page(self, data):
@@ -384,7 +402,8 @@ class Handler(BaseHTTPRequestHandler):
         preview = base64.b64encode(render_page(pdf, pno, 150)).decode("ascii")
         text = ocr_pdf_page(pdf, pno, base_url=llm["base_url"], model=llm["model"],
                             api_key=llm["api_key"], endpoint=data.get("endpoint") or "responses",
-                            detail=llm["detail"], extra=extra, dpi=dpi, timeout=data.get("timeout"))
+                            detail=llm["detail"], extra=extra, dpi=dpi, timeout=data.get("timeout"),
+                            prompt=_request_prompt(data))
         self._send(200, {"markdown": text, "png_b64_preview": preview})
 
     def _handle_dry_run(self, data):
@@ -414,7 +433,19 @@ class Handler(BaseHTTPRequestHandler):
         start = int(data.get("start") or 0)
         end = data.get("end")
         end = int(end) if end is not None and str(end).strip() != "" else None
+        # run_batch only accepts a path, so a front-end prompt is staged in a
+        # temp file that the job thread removes when it finishes.
         prompt_file = str(_res_file("prompts", "ocr_system.md"))
+        cleanup = None
+        custom_prompt = _request_prompt(data)
+        if custom_prompt is not None:
+            import os
+            import tempfile
+            fd, tmp = tempfile.mkstemp(prefix="llmocr_prompt_", suffix=".md")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(custom_prompt)
+            prompt_file = tmp
+            cleanup = tmp
         kw = dict(dpi=int(data.get("dpi") or 200), concurrency=int(data.get("concurrency") or 4),
                   retries=int(data.get("retries") if data.get("retries") is not None else 2),
                   start=start, end=end, base_url=llm["base_url"], model=llm["model"],
@@ -424,7 +455,7 @@ class Handler(BaseHTTPRequestHandler):
         jid = _new_job("batch", "batch %s" % Path(pdf).name)
         _job_set(jid, outdir=outdir)
         threading.Thread(target=_run_batch_job,
-                         args=(jid, pdf, outdir, kw), daemon=True).start()
+                         args=(jid, pdf, outdir, kw, cleanup), daemon=True).start()
         log("batch job %s started pdf=%s key=%s" % (jid, pdf, masked_key(llm["api_key"])))
         self._send(200, {"job_id": jid})
 

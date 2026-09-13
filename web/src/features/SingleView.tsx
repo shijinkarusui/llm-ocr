@@ -47,17 +47,17 @@ export function SingleView() {
       };
       if (kind === "image-url") {
         if (!url.trim()) throw new Error("请填写远端 URL");
-        const r = await ocrUrl(p, url.trim());
+        const r = await ocrUrl(p, url.trim(), s.ocrPrompt);
         setMarkdown(r.markdown);
       } else if (kind === "pdf-page") {
         if (!path.trim()) throw new Error("请选择有效 PDF（服务端可读路径）");
-        const r = await ocrPdfPage(p, path.trim(), pno, s.dpi);
+        const r = await ocrPdfPage(p, path.trim(), pno, s.dpi, s.ocrPrompt);
         setMarkdown(r.markdown);
         if (r.png_b64_preview) setPreview(r.png_b64_preview);
       } else {
         if (!path.trim()) throw new Error("请选择有效图片");
         const b64 = await readImageB64(path.trim());
-        const r = await ocrImage(p, b64);
+        const r = await ocrImage(p, b64, s.ocrPrompt);
         setMarkdown(r.markdown);
       }
       setPhase("done");
@@ -132,6 +132,11 @@ export function SingleView() {
               <span className="text-xs text-muted-foreground">从 0 开始数</span>
             </div>
           )}
+          <p role="status" className="text-xs leading-5 text-muted-foreground">
+            {s.ocrPrompt.trim()
+              ? `使用自定义提示词（${s.ocrPrompt.length} 字，在「参数」页编辑）`
+              : "使用默认提示词（可在「参数」页自定义）"}
+          </p>
           {preview && (
             <img
               src={`data:image/png;base64,${preview}`}
