@@ -193,7 +193,10 @@ def polish_with_llm(
         polished, usage, _ = responses_create(prompt, instructions="You are a Chinese OCR post-processor.", base_url=base_url, model=model, api_key=api_key, **extra)
     elif ep in ("messages", "anthropic"):
         sys_prompt = extra.pop("system", "You are a Chinese OCR post-processor.") if "system" in extra else "You are a Chinese OCR post-processor."
-        polished, usage, _ = anthropic_messages([{"role": "user", "content": prompt}], base_url=base_url, model=model, api_key=api_key, max_tokens=extra.pop("max_tokens", 8192), **{"system": sys_prompt, **extra})
+        # Defer to anthropic_messages' own ceiling unless the caller asked for
+        # an explicit one: the old hardcoded 8192 was a third, unrelated
+        # default sitting between this call site and llm_client.
+        polished, usage, _ = anthropic_messages([{"role": "user", "content": prompt}], base_url=base_url, model=model, api_key=api_key, **{"system": sys_prompt, **extra})
     else:
         polished, usage, _ = chat_completions([{"role": "user", "content": prompt}], base_url=base_url, model=model, api_key=api_key, **extra)
 

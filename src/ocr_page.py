@@ -8,7 +8,7 @@ official OpenAI / Responses / Anthropic param without changing this file.
 Examples:
   # chat (default)
   python -m src.ocr_page --image tests/cand_165.png --output out/cand_165.md
-  python -m src.ocr_page --image tests/cand_165.png --output out/cand_165.md --endpoint chat --detail high --extra-json '{"temperature":0.2,"max_completion_tokens":8192}'
+python -m src.ocr_page --image tests/cand_165.png --output out/cand_165.md --endpoint chat --detail high --extra-json '{"temperature":0.2,"reasoning_effort":"low"}'
 
   # responses
   python -m src.ocr_page --image tests/cand_165.png --output out/resp.md --endpoint responses --extra-json '{"reasoning":{"effort":"low"}}'
@@ -263,7 +263,7 @@ def main() -> int:
     parser.add_argument("--endpoint", type=str, default="chat", help="chat | responses | messages (default chat). Octopus exposes all three on /v1/*")
     parser.add_argument("--detail", type=str, default="high", help="Image detail: high|low|auto (default high, recommended for IPA)")
     parser.add_argument("--system", type=str, default=None, help="System prompt override (Anthropic 'system'); for chat/responses it merges as extra.system if needed")
-    parser.add_argument("--extra-json", type=str, default=None, help='JSON object merged into request body, e.g. \'{"temperature":0.2,"reasoning_effort":"low","max_completion_tokens":8192}\'')
+    parser.add_argument("--extra-json", type=str, default=None, help='JSON object merged into request body, e.g. \'{"temperature":0.2,"reasoning_effort":"low","max_output_tokens":20000}\'')
     args = parser.parse_args()
 
     extra = _parse_extra(args.extra_json)

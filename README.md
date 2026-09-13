@@ -166,7 +166,7 @@ Single page / batch:
 python src/ocr_page.py --image tests/cand_165.png --output out/cand_165.md
 python src/ocr_page.py --image tests/cand_165.png --output out/a.md \
   --endpoint chat --detail high \
-  --extra-json '{"temperature":0.2,"max_completion_tokens":8192}'
+  --extra-json '{"temperature":0.2,"reasoning_effort":"low"}'
 python src/batch_plan.py --dry-run --endpoint responses
 python src/batch_plan.py --pdf book.pdf --output-dir out --endpoint chat
 ```
