@@ -603,6 +603,32 @@ def _geometric_gate(
     }
 
 
+def _resolve_page_numbers(
+    page_numbers: Sequence[int] | None,
+    align_report: dict[str, Any],
+    page_count: int,
+) -> list[int]:
+    """Map each output page back to the source page it was built from.
+
+    A subset PDF (say one built from source page 100 alone) carries no record
+    of its origin, so defaulting to ``range(page_count)`` looks up the wrong
+    Markdown and the wrong align entry -- a single-page body PDF would silently
+    be checked against page 0.  The align report records ``page_index`` per
+    page and is the authoritative map; only fall back to output positions when
+    it does not cover the document.
+    """
+    if page_numbers is not None:
+        return list(page_numbers)
+    reported = [
+        int(entry["page_index"])
+        for entry in align_report.get("pages", [])
+        if isinstance(entry.get("page_index"), int)
+    ]
+    if len(reported) >= page_count:
+        return reported[:page_count]
+    return list(range(page_count))
+
+
 def verify_alignment(
     out_pdf: str | Path,
     md_dict: dict[str, Any],
@@ -638,10 +664,7 @@ def verify_alignment(
     sum_covered = 0.0
 
     with fitz.open(str(pdf)) as doc:
-        orig_numbers = list(page_numbers) if page_numbers is not None else list(range(doc.page_count))
-        if len(orig_numbers) < doc.page_count:
-            # Subset PDFs may have fewer pages; map by output position, not by value.
-            pass
+        orig_numbers = _resolve_page_numbers(page_numbers, align_report, doc.page_count)
         for pno in range(doc.page_count):
             orig_pno = orig_numbers[pno] if pno < len(orig_numbers) else pno
             page = doc.load_page(pno)
@@ -812,6 +835,11 @@ def main() -> int:
     parser.add_argument("--boxes-json", type=Path, help="align_out/boxes.json")
     parser.add_argument("--align-report", type=Path, help="align_out/align_report.json")
     parser.add_argument("--report", type=Path, help="verify_report.json output path")
+    parser.add_argument(
+        "--page-numbers",
+        help="comma-separated source page indexes for a subset output PDF "
+             "(default: derived from the align report)",
+    )
     args = parser.parse_args()
 
     if args.verify_alignment:
@@ -819,9 +847,13 @@ def main() -> int:
         if any(item is None for item in required):
             parser.error("--verify-alignment requires --out-pdf --md-json --boxes-json --align-report")
         md_dict = json.loads(args.md_json.read_text(encoding="utf-8"))
+        page_numbers = None
+        if args.page_numbers:
+            page_numbers = [int(v) for v in args.page_numbers.split(",") if v.strip()]
         result = verify_alignment(
             args.out_pdf, md_dict, args.boxes_json, args.align_report, args.report,
             keywords=args.keyword or None,
+            page_numbers=page_numbers,
         )
         print("verify_alignment=" + _ascii_json(result["summary"]))
         return 0
