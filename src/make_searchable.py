@@ -270,6 +270,51 @@ def _measured_width(text: str, fontsize: float) -> tuple[float, list[tuple[str, 
     return total, segments
 
 
+def _fitz_font(font_name: str) -> "fitz.Font":
+    """fitz.Font object for a layout font name (mirrors _font_width routing)."""
+    if font_name == "ocripa" and IPA_FONT_PATH.is_file():
+        return fitz.Font(fontfile=str(IPA_FONT_PATH))
+    if font_name == "ocrisym" and SEGOE_SYM_FONT_PATH.is_file():
+        return fitz.Font(fontfile=str(SEGOE_SYM_FONT_PATH))
+    return fitz.Font(fontname=font_name)
+
+
+def _insert_scaled(
+    page: fitz.Page,
+    start_x: float,
+    y_baseline: float,
+    segments: list[tuple[str, str]],
+    fontsize: float,
+    scale: float,
+) -> None:
+    """Insert pre-split font segments with a horizontal-only stretch.
+
+    The run is laid out from x=0 and then mapped by ``Matrix(scale, 0, 0, 1,
+    start_x, 0)``, so it begins exactly at ``start_x`` and spans
+    ``scale * natural_width`` while keeping its height. This is the PyMuPDF
+    equivalent of Umi-OCR's ReportLab ``setHorizScale`` box fitting: the
+    invisible layer covers the same horizontal extent as the printed glyphs it
+    transcribes, which is what makes selection/copy highlighting line up.
+    """
+    writer = fitz.TextWriter(page.rect)
+    cursor = 0.0
+    for font_name, seg in segments:
+        if not seg.strip():
+            continue
+        writer.append(
+            fitz.Point(cursor, y_baseline),
+            seg,
+            font=_fitz_font(font_name),
+            fontsize=max(0.5, float(fontsize)),
+        )
+        cursor += _font_width(font_name, seg, fontsize)
+    morph = (
+        fitz.Point(0.0, 0.0),
+        fitz.Matrix(float(scale), 0.0, 0.0, 1.0, float(start_x), 0.0),
+    )
+    writer.write_text(page, render_mode=3, morph=morph, overlay=True)
+
+
 def _insert_segmented(
     page: fitz.Page,
     x_anchor: float,
@@ -279,6 +324,7 @@ def _insert_segmented(
     *,
     align: str = "left",
     rotate: float = 0.0,
+    scale: float = 1.0,
 ) -> None:
     """Insert one logical line as multiple font segments using the layout formula.
 
@@ -286,6 +332,12 @@ def _insert_segmented(
     whole line first. With ``rotate=90`` the line runs bottom-to-top (the
     typical orientation of a rotated y-axis label): segments stack upward from
     ``y_baseline`` at a fixed ``x_anchor``.
+
+    ``scale`` applies a horizontal-only stretch (Umi-OCR style box fitting):
+    the line is laid out from its left edge and then mapped through
+    ``Matrix(scale, 0, 0, 1, start, 0)``, so the glyph run spans exactly
+    ``scale * natural_width`` without changing its height. Search, selection
+    and copy still work because the text operators keep their order.
     """
     if not text:
         return
@@ -317,6 +369,9 @@ def _insert_segmented(
         start = x_anchor - width / 2.0
     elif align == "right":
         start = x_anchor - width
+    if abs(scale - 1.0) > 0.01 and width > 0.0:
+        _insert_scaled(page, start, y_baseline, segments, fontsize, scale)
+        return
     cursor = start
     for font, seg in segments:
         # Skip whitespace-only segments (e.g. "\n" inside a MinerU block).
@@ -976,6 +1031,62 @@ def _is_rotated_axis_label(text: str, box_width_norm: float, box_height_norm: fl
     )
 
 
+MIN_HSCALE = 0.5
+MAX_HSCALE = 3.0
+BOX_HEIGHT_TO_FONT = 1.0
+
+
+def _fit_box_text(
+    text: str,
+    box_height: float,
+    box_width: float,
+    *,
+    min_fontsize: float = MIN_FONT_PT,
+) -> tuple[float, float]:
+    """Umi-OCR's ``_calculateFontSize``: fit the glyph run to the box WIDTH.
+
+    Ported from ``UmiOCR-data/py_src/ocr/output/output_pdf_layered.py``: start
+    from the box height, walk the size down until the run fits the box width,
+    walk it back up until it just exceeds it, then refine in 0.1pt steps. The
+    glyph aspect ratio is never distorted, and a printed line whose ink is
+    shorter than its em box still gets its true point size — fitting to the box
+    HEIGHT alone (the old behaviour) undersized exactly those lines, which is
+    why the cover title rendered far smaller than the print.
+
+    Returns ``(fontsize, 1.0)``; the horizontal-stretch path stays available
+    for other callers, but Umi-OCR never stretches.
+    """
+    if box_height > box_width:  # vertical text: measure along the long axis
+        box_width, box_height = box_height, box_width
+    limit = max(1.0, float(min_fontsize))
+    # Umi-OCR leaves the upward walk unbounded, which is safe only because its
+    # boxes come from an OCR detector and contain exactly the text in the box.
+    # Our Markdown occasionally disagrees with the printed band, so cap the
+    # size at 1.6x the ink height: real printed glyphs never exceed that
+    # (Latin caps top out near 1.55x, CJK near 1.35x).
+    ceiling = max(limit, float(box_height) * 1.6)
+    fontsize = float(min(max(limit, round(float(box_height))), ceiling))
+    measured, _segments = _measured_width(text, fontsize)
+    if measured <= 0.0:
+        return fontsize, 1.0
+    while measured > box_width and fontsize > limit:
+        fontsize = max(limit, fontsize - 1.0)
+        measured, _segments = _measured_width(text, fontsize)
+    guard = 0
+    while measured < box_width and fontsize < ceiling:
+        fontsize = min(ceiling, fontsize + 1.0)
+        measured, _segments = _measured_width(text, fontsize)
+        guard += 1
+        if guard > 400:
+            break
+    while measured > box_width and fontsize > limit:
+        fontsize = max(limit, fontsize - 0.1)
+        measured, _segments = _measured_width(text, fontsize)
+        if measured <= 0.0:
+            break
+    return fontsize, 1.0
+
+
 def plan_boxed_lines(
     lines: list[dict[str, Any]],
     width: float,
@@ -1006,11 +1117,12 @@ def plan_boxed_lines(
         box_height = max(1.0, y1 - y0)
         box_width = max(1.0, x1 - x0)
         text = str(line.get("text", ""))
-        fontsize = max(1.0, min(box_height * 0.92, box_height * 0.78 + 1.0))
+        # Umi-OCR-style fitting: the font size comes from the box HEIGHT and
+        # the horizontal extent is matched by a horizontal-only scale. Shrinking
+        # the font until the text happens to fit (the old behaviour) is what
+        # made the invisible layer's glyphs far smaller than the printed ones.
+        fontsize, hscale = _fit_box_text(text, box_height, box_width)
         measured, _segments = _measured_width(text, fontsize)
-        if measured > box_width:
-            scaled = fontsize * box_width / measured
-            fontsize = max(MIN_FONT_PT, scaled)
         align = str(line.get("align", "left"))
         box_width_norm = x1n - x0n
         box_height_norm = y1n - y0n
@@ -1065,10 +1177,14 @@ def plan_boxed_lines(
             # (A/B/C/D labels) at their box centers so the physical reading order
             # matches the box order even when label and caption font sizes differ.
             font_name = _font_for_line(wrapped[0])
-            baseline = (y0 + y1) / 2.0 + _center_baseline_offset(font_name, fontsize)
+            # Umi-OCR anchors the baseline at the box's bottom-left corner
+            # (`point = fitz.Point(x0, y2)`), and for a tight detector/ink box
+            # the box bottom IS the printed baseline. The old centre-anchored
+            # baseline drifted by half the font height on every line.
+            baseline = y1
             plan.append({
                 "text": wrapped[0], "x": x0, "baseline": baseline,
-                "fontsize": fontsize, "align": align,
+                "fontsize": fontsize, "align": align, "scale": hscale,
                 "y_center_norm": (y0n + y1n) / 2.0, "x_center_norm": x_center_norm,
                 "x0_norm": x0n,
                 "equation_region": region,
@@ -1106,6 +1222,7 @@ def _insert_boxed_lines(page: fitz.Page, lines: list[dict[str, Any]], overflow_r
         _insert_segmented(
             page, entry["x"], entry["baseline"], entry["text"], entry["fontsize"],
             align=entry["align"], rotate=float(entry.get("rotate", 0.0)),
+            scale=float(entry.get("scale", 1.0)),
         )
 
 
@@ -1184,6 +1301,162 @@ def _fallback_only_lines(text: str, page_index: int) -> list[dict[str, Any]]:
     return lines
 
 
+def _split_text_by_widths(text: str, weights: list[float]) -> list[str]:
+    """Split ``text`` into ``len(weights)`` chunks sized by relative weight.
+
+    Weights are ``band_width / band_height`` — a rough count of how many glyphs
+    a printed band holds, since a band of large type fits fewer characters than
+    a band of small type of the same width. Used when Markdown collapsed
+    several printed lines into one string: the invisible layer then still
+    follows the printed line layout instead of parking one oversized line in
+    the middle of the block.
+    """
+    if len(weights) <= 1:
+        return [text]
+    total = sum(w for w in weights if w > 0.0)
+    if total <= 0.0:
+        return [text]
+    targets: list[float] = []
+    acc = 0.0
+    for w in weights[:-1]:
+        acc += max(0.0, w)
+        targets.append(acc / total)
+    units_total = 0.0
+    for ch in text:
+        if not ch.isspace():
+            units_total += 1.0 if ord(ch) > 0x2E80 else 0.5
+    if units_total <= 0.0:
+        return [text]
+    chunks: list[str] = []
+    cur: list[str] = []
+    acc = 0.0
+    ti = 0
+    armed = False
+    for ch in text:
+        cur.append(ch)
+        if not ch.isspace():
+            acc += 1.0 if ord(ch) > 0x2E80 else 0.5
+        if ti < len(targets) and acc / units_total >= targets[ti]:
+            # Only arm the cut here; the actual split waits for the next word
+            # boundary so a run like "1999" or "XIANDAI" is never cut in half
+            # (splitting mid-token makes that token unsearchable).
+            armed = True
+        if armed and ch.isspace():
+            piece = "".join(cur).strip()
+            if piece:
+                chunks.append(piece)
+                cur = []
+                ti += 1
+                armed = False
+    tail = "".join(cur).strip()
+    if tail:
+        chunks.append(tail)
+    return chunks
+
+
+def _ink_aligned_lines(
+    text: str,
+    page: fitz.Page,
+    pno: int,
+) -> list[dict[str, Any]]:
+    """Geometry lines derived from the raster ink profile of a scanned page.
+
+    Used when neither external (MinerU) boxes nor embedded vector text exist.
+    Printed line bands are detected on the bitmap and the page's Markdown lines
+    are assigned to them in reading order; several Markdown lines landing in
+    one band are stacked inside it so nothing is lost. This replaces the
+    synthetic full-width strips that parked the invisible layer in the left
+    margin while the print sat centred.
+    """
+    try:
+        from .ink_layout import detect_normalized_boxes
+    except ImportError:
+        from ink_layout import detect_normalized_boxes
+    try:
+        boxes = detect_normalized_boxes(page)
+    except Exception:
+        return []
+    md_lines = [ln.strip() for ln in _as_text_normalized(text).splitlines() if ln.strip()]
+    if not boxes or not md_lines:
+        return []
+    total_boxes = len(boxes)
+    total_lines = len(md_lines)
+    # Adaptive height clamp: a band far taller than this page's typical band is
+    # a merged block (figure, table rule, scan bleed), not one printed line.
+    # Left alone it hands the fitted font that whole height — which is where the
+    # 68pt "body text" on page 100 came from. Shrink it around its own centre so
+    # the text stays on the page at a plausible size.
+    heights: list[float] = []
+    for raw in boxes:
+        try:
+            hh = float(raw[3]) - float(raw[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if hh > 0.0:
+            heights.append(hh)
+    heights.sort()
+    median_h = heights[len(heights) // 2] if heights else 0.0
+    max_h = median_h * 2.5
+    lines: list[dict[str, Any]] = []
+    order = 0
+    for i, txt in enumerate(md_lines):
+        lo = int(i * total_boxes / total_lines)
+        hi = int((i + 1) * total_boxes / total_lines)
+        if hi <= lo:
+            hi = lo + 1
+        group = boxes[lo:min(hi, total_boxes)] or [boxes[min(lo, total_boxes - 1)]]
+        parsed: list[tuple[float, float, float, float]] = []
+        for raw in group:
+            try:
+                bx0, by0, bx1, by1 = (float(v) for v in raw)
+            except (TypeError, ValueError):
+                continue
+            if bx1 > bx0 and by1 > by0:
+                if max_h > 0.0 and (by1 - by0) > max_h:
+                    cy = (by0 + by1) / 2.0
+                    by0 = cy - max_h / 2.0
+                    by1 = cy + max_h / 2.0
+                parsed.append((bx0, by0, bx1, by1))
+        if not parsed:
+            continue
+        # One Markdown line per printed band wherever possible: bands are tight
+        # (their height IS the printed line height), so the fitted font stays
+        # honest. Merging several bands into one union box produced 60pt boxes
+        # and 68pt "body text", which is what the old numbers showed.
+        pieces = [txt]
+        slots = parsed
+        if len(parsed) > 1:
+            weights = [(b[2] - b[0]) / max(1.0, b[3] - b[1]) for b in parsed]
+            split = _split_text_by_widths(txt, weights)
+            if len(split) == len(parsed):
+                pieces = split
+            else:
+                slots = [(
+                    min(b[0] for b in parsed),
+                    min(b[1] for b in parsed),
+                    max(b[2] for b in parsed),
+                    max(b[3] for b in parsed),
+                )]
+        for si, (piece, slot) in enumerate(zip(pieces, slots)):
+            lines.append({
+                "text": piece,
+                "box": [slot[0], slot[1], slot[2], slot[3]],
+                "source": "ink",
+                "mode": "aligned",
+                "line_id": f"I{pno:04d}L{order:04d}",
+                "column": 0,
+                "cell_row": None,
+                "cell_col": None,
+                "subline_index": si,
+                "order": order,
+                "order_exempt": False,
+                "header_footer": False,
+                "align": "left",
+            })
+            order += 1
+    return lines
+
+
 def make_searchable(
     pdf_path: str | Path,
     page_nums_0based: Sequence[int],
@@ -1250,8 +1523,13 @@ def make_searchable(
                         page_lines = ext
                         reason = "external"
                     else:
-                        page_lines = _fallback_only_lines(text, pno)
-                        reason = "external_bad"
+                        ink_lines = _ink_aligned_lines(text, source_page, pno)
+                        if ink_lines:
+                            page_lines = ink_lines
+                            reason = "ink"
+                        else:
+                            page_lines = _fallback_only_lines(text, pno)
+                            reason = "external_bad"
                 elif geo_source == "embedded":
                     geom = _extract_lines(source_page, known_header_anchors)
                     page_lines, page_metrics = _align_page(text, geom, pno)
@@ -1262,9 +1540,20 @@ def make_searchable(
                         page_lines = ext
                         reason = "external"
                     else:
-                        geom = _extract_lines(source_page, known_header_anchors)
-                        page_lines, page_metrics = _align_page(text, geom, pno)
-                        reason = "embedded" if geom.get("reliable") else "embedded_no_geom"
+                        # Tight per-line boxes from the raster ink profile come
+                        # first: the source PDF's own geometry is often
+                        # block-level (one tall box per paragraph), and a tall
+                        # box hands the fitted font a size far larger than the
+                        # print. Ink bands are tight by construction.
+                        ink_lines = _ink_aligned_lines(text, source_page, pno)
+                        if ink_lines:
+                            page_lines = ink_lines
+                            page_metrics = None
+                            reason = "ink"
+                        else:
+                            geom = _extract_lines(source_page, known_header_anchors)
+                            page_lines, page_metrics = _align_page(text, geom, pno)
+                            reason = "embedded" if geom.get("reliable") else "embedded_no_geom"
 
                 aligned, header_footer, fallback = _partition_lines(page_lines)
                 if reason == "external" and aligned:
