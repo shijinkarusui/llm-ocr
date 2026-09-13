@@ -1,0 +1,27 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "llm-ocr main window: scoped permissions, no wildcard defaults",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:tray:default",
+    "core:menu:default",
+    "core:event:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-unminimize",
+    "opener:allow-open-path",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "notification:allow-notify",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission",
+    "process:allow-exit",
+    "process:allow-restart",
+    "shell:allow-spawn",
+    "shell:allow-kill",
+    "shell:allow-open"
+  ]
+}

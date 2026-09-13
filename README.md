@@ -2,8 +2,9 @@
 
 > Vision-LLM OCR toolchain for scanned Chinese phonetics textbooks: per-page
 > Markdown transcription (IPA-safe) + raster-backed searchable dual-layer PDF,
-> driven by any OpenAI-compatible gateway. Desktop GUI (Tkinter, stdlib-only)
-> and CLI share one engine. API key lives in memory/env only — never in git.
+> driven by any OpenAI-compatible gateway. Desktop app (Tauri 2 + React 19,
+> engine sidecar over HTTP) and CLI share one engine. API key lives in
+> memory/env only — never in git.
 
 English overview first; full Chinese manual below (Chapters 1-9).
 
@@ -36,16 +37,15 @@ English overview first; full Chinese manual below (Chapters 1-9).
               +----------------+      +-----------------+
               |                                       |
      +--------v--------+                   +----------v--------+
-     |  DESKTOP GUI    |  shared State     |       CLI         |
-     |  app_gui.py     |<----------------->|  src/cli.py       |
-     |  (Tkinter,      |  base_url/model/  |  models/probe/    |
-     |   stdlib only)  |  key/endpoint/    |  ocr/batch/       |
-     |                 |  detail/dpi/...   |  config/--tui     |
-     | 5 tabs: connect |                   |                   |
-     | single / batch /|                   |  thin dispatch:   |
-     | searchable /    |                   |  cli.py -> per-   |
-     | params + bottom |                   |  module mains,    |
-     | log console     |                   |  one resolve path |
+     |  DESKTOP APP    |  HTTP bridge      |       CLI         |
+     |  web/ (Tauri)   |<----------------->|  src/cli.py       |
+     |  React 5 views  |  serve.py :21139  |  models/probe/    |
+     |  + log console  |  key in memory    |  ocr/batch/       |
+     |  + status bar   |  job poll/cancel  |  config/--tui     |
+     |                 |                   |                   |
+     |                 |  thin dispatch:   |  cli.py -> per-   |
+     |                 |  bridge -> engine |  module mains,    |
+     |                 |                   |  one resolve path |
      +--------+--------+                   +----------+--------+
               |                                       |
               +-------------------+-------------------+
@@ -119,8 +119,8 @@ English overview first; full Chinese manual below (Chapters 1-9).
 | Page/Batch | `src/ocr_page.py`, `src/batch_plan.py` | Single shot, thread pool + adaptive concurrency, `usage.jsonl` resume | Gateway internals |
 | Render/Search | `src/render.py`, `src/make_searchable.py` | 200dpi raster, raster-bg + hidden text, box/exact vs fallback | LLM params |
 | Quality | `src/check_notation.py`, `src/postprocess.py`, `src/verify_searchable.py` | Notation gate, CJK cleanup + merge, keyword/copyable verify | Secrets |
-| GUI | `app_gui.py`, `gui/*` (stdlib only) | 5 tabs, shared `State`, `Runner` bg threads, `LogBus`, Per-Monitor V2 DPI auto-adapt | Engine logic |
-| CLI | `src/cli.py`, `src/cli_common.py`, `src/interactive.py` | One flag source (`add_llm_args`), subcommands, TUI shim | GUI widgets |
+| UI | `web/` (Tauri 2 + React 19) + `serve.py` bridge | 5 views, typed `lib/engine.ts`, tray/single-instance/native dialogs | Engine logic |
+| CLI | `src/cli.py`, `src/cli_common.py`, `src/interactive.py` | One flag source (`add_llm_args`), subcommands, TUI shim | UI widgets |
 
 ### Data flow (one page)
 
@@ -153,8 +153,9 @@ PDF page --render.py(200dpi)--> PNG bytes
 ```bash
 pip install -r requirements.txt        # python-dotenv + PyMuPDF
 cp .env.example .env                  # fill in LLM_OCR_KEY (never commit .env)
-python app_gui.py                     # desktop GUI
-python app_gui.py --smoke             # headless 5-tab build check
+python serve.py                       # engine bridge (:21139)
+cd web && pnpm dev                  # frontend (:1420)
+# 或联调：pnpm tauri dev（Rust 拉起 serve sidecar）
 python -m src.cli models              # list gateway models
 python -m src.cli probe --image tests/cand_165.png
 ```
@@ -188,14 +189,13 @@ payload, usage = generic_request(
 
 扫描版中文语音学教材的 Vision-LLM OCR 工具链：逐页高精度 Markdown 转录
 （IPA 原样、附加符号 Unicode 组合正确）+ 原尺寸光栅垫底的双层可搜索 PDF。
-桌面 GUI（Tkinter，纯标准库）与 CLI 共用同一套 `src/` 引擎；
+桌面应用（Tauri 2 + React 19）经 `serve.py` 桥接调用同一套 `src/` 引擎，
 网关只要求 OpenAI 兼容（`chat / responses / messages` 三入站全开即可，
 实测为 Octopus 网关；OpenAI / AxonHub 同协议可直接换）。
 
 核心设计取舍：
 
-- **引擎与界面分离**：`src/` 不 import 任何 GUI；`gui/` 只做参数搬运 +
-  后台线程调度（`Runner`）+ 日志泵（`LogBus`），OCR 逻辑无重复。
+- **引擎与界面分离**：`src/` 不 import 任何 UI；前端经强类型 `lib/engine.ts`
 - **配置双轨**：`GlobalConfig{base_url,model,key,timeout}` vs
   `RunConfig{endpoint,detail,concurrency,dpi,retries,system,extra}`，
   优先级 CLI > 环境变量 > 默认值；Key 只驻内存，`write_env()` 永不写明文，
@@ -208,15 +208,9 @@ payload, usage = generic_request(
 
 ```
 llm-ocr/
-  app_gui.py            # GUI 唯一入口（Tkinter；frozen EXE 同路）
-  gui/                  # 界面层（stdlib only）：gui_core + 5 个 tab_*
-    gui_core.py         # 主题/State/Runner/LogBus/apply_theme/init_dpi
-    tab_connect.py      # 1·连接：同步参数/拉模型/单图探活/脱敏核验
-    tab_single.py       # 2·单页：图片/PDF单页/图片链接 OCR
-    tab_batch.py        # 3·批量：断点续跑 + usage.jsonl 实时计数
-    tab_searchable.py   # 4·双层：构建 book_searchable.pdf + 关键词验证
-    tab_params.py       # 5·参数：链路/清晰度/并发/超时/DPI/重试/透传JSON
-    app_gui.py          # shim：dev 与 EXE 单代码路径
+  serve.py              # 引擎桥接（stdlib HTTP，127.0.0.1:21139，job 制）
+  serve.spec            # serve.exe 打包配置（约 45MB onefile）
+  web/                  # Tauri 2 + React 19 新前端（见 spec-new-ui.md）
   src/                  # 引擎层
     config.py           # 中央配置（Global/Run 双 dataclass，dotenv 首句加载）
     llm_client.py       # 三协议传输核心（982 行，见第 4 章）
@@ -237,7 +231,6 @@ llm-ocr/
   tests/                # 样张 cand_165/166/167.png + page21_150.png 等
   requirements.txt      # python-dotenv + PyMuPDF（仅此两个运行时依赖）
   .env.example          # 可配 URL 契约文档（.env 本体 git-ignored）
-  llm-ocr-gui.spec      # PyInstaller 打包配置（排重后约 32MB）
   out/                  # 运行产物目录（git-ignored；随仓库只留 gui_redesign 报告）
 ```
 
@@ -302,26 +295,16 @@ llm-ocr/
 7. **验证**（`verify_searchable.py`）：`verify(pdf, keywords)` 逐页关键词命中 +
    可复制总字数；`compare_md` 用 difflib 相似度比对两份 Markdown。
 
-## 6. GUI（app_gui.py + gui/）
+## 6. 桌面应用（Tauri 2 + React 19 + serve.py 桥接）
 
-- 单入口 `python app_gui.py`（`--smoke` 无头构建 5 页签，不进 mainloop）；
-  `gui/app_gui.py` 为 shim，dev 与 frozen EXE 单代码路径
-  （`_MEIPASS` 处理）。
-- `gui_core.py`：纸面档案室主题（`apply_theme`，clam 基）、字体 token
-  （Microsoft YaHei UI / Consolas）、共享 `State`（Key 只驻内存）、
-  `Runner`（阻塞调用丢守护线程，完成回 UI 线程）、`LogBus`
-  （线程安全队列 + `after(120)` 泵）、卡片/行/输出区小构件。
-- **DPI 自适应**（`init_dpi`，零开关）：建窗前进程级 Per-Monitor V2
-  （`SetProcessDpiAwareness(2)`，失败回退 `SetProcessDPIAware`）→ 建窗后读
-  本窗所在显示器真实 DPI（`GetDpiForWindow` → `GetDeviceCaps(LOGPIXELSX)` →
-  `winfo_fpixels` → 96 兜底），设 `tk scaling = dpi/72`；
-  换显示器/改缩放后重开即自动适配。注意参数页“DPI”滑杆是 OCR **渲染**
-  分辨率，与界面缩放无关。
-- 5 页签：`tab_connect`（同步参数/拉模型/探活）→ `tab_single` →
-  `tab_batch`（`usage.jsonl` 实时计数 p50/p95）→ `tab_searchable` →
-  `tab_params`（链路/清晰度/并发/超时/DPI/重试/透传 JSON + 看提示词 +
-  标号校验）。
-
+- 架构：Tauri 外壳（托盘/单实例/窗口记忆/原生对话框）+ React 前端
+  （连接/单页/批量/双层/参数 5 视图 + 日志控制台 + 状态栏）+ `serve.py`
+  引擎桥接（stdlib `http.server`，`127.0.0.1:21139`，job 制长任务）。
+- Key 只驻前端内存，经请求 body/header 进桥接；日志只打 `sk-**** len=N`。
+- 开发：`python serve.py`（桥接）+ `cd web && pnpm dev`（前端，:1420）；
+  联调：`pnpm tauri dev`（Rust 拉起 serve sidecar，失败回退 python 直跑）。
+- 契约：`tests/test_serve_contract.py`（health/prompt/dry-run/notation 全离线）。
+  详见 `spec-new-ui.md` §3 API 契约表。
 ## 7. CLI（src/cli.py + cli_common.py）
 
 `python -m src.cli <models|probe|ocr|batch|config> [--tui]`；
@@ -332,11 +315,11 @@ llm-ocr/
 
 ## 8. 打包
 
-`llm-ocr-gui.spec`（PyInstaller）：`pathex` 覆盖根/src/gui；
-`datas` 带提示词与样张；`hiddenimports` 列全引擎+界面模块；
-`excludes` 剔除 torch/transformers/gradio 等巨型簇（v1 372MB → v2 约 32MB）。
-DPI 代码仅 `ctypes`（标准库，随包走）+ tkinter，无新增依赖，frozen 下同样先生效。
-
+`serve.spec`（PyInstaller onefile，console=False）：`pathex` 覆盖根/src；
+`datas` 带 prompts/*.md + tests/cand_165.png（冻结经 `sys._MEIPASS` 由
+`serve._res_file` 解析）；`hiddenimports` 列全引擎模块；`excludes` 沿用旧
+瘦身表（约 45MB，serve.exe）。Tauri `externalBin: binaries/serve` 随包，
+NSIS（currentUser）+ MSI 双产物：setup.exe 约 46MB。
 ## 9. 安全与限制
 
 - Key 永不进仓库（`.gitignore`: `.env / out/ / __pycache__ / dist/ /

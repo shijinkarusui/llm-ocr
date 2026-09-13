@@ -1,15 +1,21 @@
 # -*- mode: python ; coding: utf-8 -*-
-# llm-ocr-gui v2: clean-venv build. pathex covers src+gui so bundled modules resolve;
-# excludes drop the conda giant cluster (torch/gradio/transformers/...) that bloated v1 to 372MB.
+# serve v1: engine-bridge sidecar for the Tauri UI (S9).
+# Entry serve.py is stdlib-only; engine modules come from src/ via pathex.
+# Datas: prompts/*.md + tests/cand_165.png (probe fixture), resolved at
+# runtime through serve._res_file (sys._MEIPASS when frozen).
+# Excludes 复用旧 Tkinter 打包的瘦身表（conda 巨型簇）-> ~45MB onefile。
 PROJ = '.'
 block_cipher = None
 a = Analysis(
-    ['app_gui.py'],
-    pathex=[PROJ, PROJ + '/src', PROJ + '/gui'],
+    ['serve.py'],
+    pathex=[PROJ, PROJ + '/src'],
     binaries=[],
-    datas=[(PROJ + '/prompts/ocr_system.md', 'prompts'), (PROJ + '/tests/cand_165.png', 'tests')],
+    datas=[
+        (PROJ + '/prompts/ocr_system.md', 'prompts'),
+        (PROJ + '/prompts/notation_spec.md', 'prompts'),
+        (PROJ + '/tests/cand_165.png', 'tests'),
+    ],
     hiddenimports=[
-        'gui_core', 'tab_connect', 'tab_single', 'tab_batch', 'tab_searchable', 'tab_params',
         'llm_client', 'batch_plan', 'ocr_page', 'config', 'check_notation',
         'postprocess', 'make_searchable', 'verify_searchable', 'render',
         'geom_extract', 'geom_align',
@@ -35,7 +41,7 @@ a = Analysis(
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz, a.scripts, a.binaries, a.zipfiles, a.datas, [],
-    name='llm-ocr-gui', debug=False, bootloader_ignore_signals=False,
+    name='serve', debug=False, bootloader_ignore_signals=False,
     strip=False, upx=False, console=False,
     disable_windowed_traceback=False, argv_emulation=False,
     target_arch=None, codesign_identity=None, entitlements_file=None,

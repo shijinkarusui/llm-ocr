@@ -7,3 +7,14 @@ dist/
 build/
 build-v2/
 *.spec.bak
+
+# S9/S10: new-UI build outputs (never commit binaries)
+dist-serve/
+build-serve/
+web/dist/
+web/src-tauri/target/
+web/src-tauri/binaries/
+web/src-tauri/WixTools/
+*.exe
+*.msi
+.serve-*.lock
