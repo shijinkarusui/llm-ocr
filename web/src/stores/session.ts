@@ -52,7 +52,7 @@ interface SessionState {
 }
 
 export const useSession = create<SessionState>((set) => ({
-  baseUrl: "http://127.0.0.1:2113/v1",
+  baseUrl: "",
   apiKey: "",
   model: "OC/muse-spark-1.3-contributor-free",
   endpoint: "responses",

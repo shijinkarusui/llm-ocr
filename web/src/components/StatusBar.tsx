@@ -11,8 +11,9 @@ export function StatusBar() {
   try {
     host = new URL(baseUrl).host;
   } catch {
-    /* keep raw */
+    /* 未填或格式不完整时保持原样 */
   }
+  if (!host) host = "未设置";
 
   return (
     <footer

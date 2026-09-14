@@ -87,7 +87,12 @@ export function ConnectView() {
         <CardContent className="flex flex-col gap-3">
           <div className="flex items-center gap-2.5">
             <Label htmlFor="conn-base">网关地址</Label>
-            <Input id="conn-base" value={baseUrl} onChange={(e) => set({ baseUrl: e.target.value })} />
+            <Input
+              id="conn-base"
+              value={baseUrl}
+              placeholder="http://主机:端口/v1"
+              onChange={(e) => set({ baseUrl: e.target.value })}
+            />
           </div>
           <div className="flex items-center gap-2.5">
             <Label htmlFor="conn-key">密钥（内存）</Label>
