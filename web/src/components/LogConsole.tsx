@@ -4,12 +4,13 @@ import { cn } from "@/lib/utils";
 import { useLog, type LogKind } from "@/stores/log";
 import { Button } from "@/components/ui/button";
 
+/* 日志区两主题都是深底，所以固定用 console-* 前景色，不跟正文色走 */
 const KIND_CLASS: Record<LogKind, string> = {
-  info: "text-foreground",
-  ok: "text-emerald-500",
-  warn: "text-amber-500",
-  err: "text-destructive",
-  muted: "text-muted-foreground",
+  info: "text-console-foreground",
+  ok: "text-console-ok",
+  warn: "text-console-warn",
+  err: "text-console-err",
+  muted: "text-console-muted",
 };
 
 export function LogConsole() {
@@ -56,12 +57,12 @@ export function LogConsole() {
           tabIndex={0}
           role="log"
           aria-label="运行日志内容"
-          className="h-28 overflow-y-auto bg-[#141d2b] px-4 py-2 font-mono text-xs leading-5 dark:bg-black/40"
+          className="h-28 overflow-y-auto bg-console px-4 py-2 font-mono text-xs leading-5"
         >
-          {entries.length === 0 && <p className="text-slate-500">暂无日志。</p>}
+          {entries.length === 0 && <p className="text-console-muted">暂无日志。</p>}
           {entries.map((e) => (
             <p key={e.id} className={cn("whitespace-pre-wrap break-words", KIND_CLASS[e.kind])}>
-              <span className="text-slate-500">{e.time}  </span>
+              <span className="text-console-muted">{e.time}  </span>
               {e.msg}
             </p>
           ))}

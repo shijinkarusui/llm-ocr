@@ -57,7 +57,7 @@ export function NotationCard() {
         {phase === "idle" && (
           <EmptyState
             icon={FileWarning}
-            title="还没有输出"
+            tone="idle" title="还没有输出"
             description="“看提示词”预览系统提示词，“标号校验”检查公式标号。"
           />
         )}
@@ -68,7 +68,7 @@ export function NotationCard() {
           </div>
         )}
         {phase === "error" && (
-          <EmptyState icon={FileWarning} title="出错了" description={error} actionLabel="重试" onAction={check} />
+          <EmptyState icon={FileWarning} tone="error" title="出错了" description={error} actionLabel="重试" onAction={check} />
         )}
         {phase === "done" && res && (
           <div className="text-[13px] leading-6">

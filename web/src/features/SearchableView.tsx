@@ -143,7 +143,7 @@ export function SearchableView() {
         </CardHeader>
         <CardContent>
           {phase === "idle" && (
-            <EmptyState icon={BookOpen} title="还没有构建" description="选好原 PDF 与输出目录后点“构建并验证”。" />
+            <EmptyState icon={BookOpen} tone="idle" title="还没有构建" description="选好原 PDF 与输出目录后点“构建并验证”。" />
           )}
           {phase === "running" && (
             <div className="flex flex-col gap-2" aria-label="构建中">
@@ -152,7 +152,7 @@ export function SearchableView() {
             </div>
           )}
           {phase === "error" && (
-            <EmptyState icon={BookOpen} title="构建失败" description={error} actionLabel="重试" onAction={build} />
+            <EmptyState icon={BookOpen} tone="error" title="构建失败" description={error} actionLabel="重试" onAction={build} />
           )}
           {phase === "done" && result && (
             <div className="text-[13px] leading-6">

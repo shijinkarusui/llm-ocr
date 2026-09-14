@@ -126,7 +126,7 @@ export function ParamsView() {
           <SliderRow id="p-dpi" label="DPI" hint="默认 200" value={s.dpi} min={100} max={300} onChange={(v) => set({ dpi: v })} />
           <SliderRow id="p-retries" label="重试" hint="" value={s.retries} min={0} max={5} onChange={(v) => set({ retries: v })} />
           {s.concurrency > 8 && (
-            <p role="note" className="text-xs leading-5 text-amber-600">
+            <p role="note" className="text-xs leading-5 text-warn">
               注意：并发大于 8 后吞吐未必再涨，注意 p95 与 429。
             </p>
           )}

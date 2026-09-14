@@ -30,10 +30,15 @@ export function Sidebar() {
       className="flex w-60 shrink-0 flex-col border-r border-sidebar-border bg-sidebar"
     >
       <div className="flex h-11 items-center gap-2 px-4">
-        <span aria-hidden="true" className="flex size-6 items-center justify-center rounded-md bg-primary">
-          <BookOpen className="size-3.5 text-primary-foreground" />
-        </span>
-        <span className="text-sm font-bold text-sidebar-foreground">llm-ocr</span>
+        <img
+          src="/icons/app-icon-32.png"
+          alt=""
+          aria-hidden="true"
+          width={24}
+          height={24}
+          className="size-6 shrink-0 rounded-md"
+        />
+        <span className="font-display text-[15px] font-bold tracking-tight text-sidebar-foreground">llm-ocr</span>
       </div>
       <nav aria-label="功能视图" className="flex flex-col gap-0.5 px-2 py-1">
         {NAV.map((item) => {
@@ -46,10 +51,10 @@ export function Sidebar() {
               aria-current={active ? "page" : undefined}
               onClick={() => set({ view: item.id })}
               className={cn(
-                "flex h-8 items-center gap-2.5 rounded-md px-2.5 text-left text-[13px]",
+                "flex h-8 items-center gap-2 rounded-sm px-3 text-left text-[13px]",
                 active
-                  ? "bg-accent font-medium text-accent-foreground"
-                  : "text-sidebar-foreground hover:bg-accent/60",
+                  ? "bg-primary/12 font-bold text-primary ring-1 ring-inset ring-primary/20"
+                  : "text-sidebar-foreground hover:bg-accent",
               )}
             >
               <Icon aria-hidden="true" className="size-4 shrink-0" />
@@ -64,7 +69,7 @@ export function Sidebar() {
           variant="ghost"
           size="icon"
           aria-label={dark ? "切换到浅色" : "切换到深色"}
-          onClick={() => set({ dark: !dark })}
+          onClick={() => set({ themeMode: dark ? "light" : "dark" })}
         >
           {dark ? <Sun aria-hidden="true" /> : <Moon aria-hidden="true" />}
         </Button>

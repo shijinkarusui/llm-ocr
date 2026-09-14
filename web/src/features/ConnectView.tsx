@@ -143,7 +143,7 @@ export function ConnectView() {
           {phase === "idle" && !probeRes && (
             <EmptyState
               icon={Plug}
-              title="还没有输出"
+              tone="idle" title="还没有输出"
               description="点“拉取模型”从网关获取可用模型，或点“单图探活”验证链路。"
               actionLabel="拉取模型"
               onAction={fetchModels}
@@ -159,7 +159,7 @@ export function ConnectView() {
           {phase === "error" && (
             <EmptyState
               icon={Plug}
-              title="拉取失败"
+              tone="error" title="拉取失败"
               description={`原因：${error}。检查网关地址与密钥后重试。`}
               actionLabel="重试"
               onAction={fetchModels}

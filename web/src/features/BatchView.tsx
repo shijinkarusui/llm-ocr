@@ -194,7 +194,7 @@ export function BatchView() {
             </div>
           )}
           {phase === "error" && (
-            <EmptyState icon={Layers} title="出错了" description={error} actionLabel="重试 Dry-Run" onAction={doDry} />
+            <EmptyState icon={Layers} tone="error" title="出错了" description={error} actionLabel="重试 Dry-Run" onAction={doDry} />
           )}
           {(phase === "idle" || phase === "running" || phase === "done") && (
             <>
@@ -205,7 +205,7 @@ export function BatchView() {
               </p>
               <Progress value={prog?.pages_ok ?? 0} max={total > 0 ? total : 100} />
               {phase === "idle" && !prog && (
-                <EmptyState icon={Layers} title="尚未开始" description="跑的过程中自动轮询实时数字；中断后重跑自动续上。" />
+                <EmptyState icon={Layers} tone="idle" title="尚未开始" description="跑的过程中自动轮询实时数字；中断后重跑自动续上。" />
               )}
               {phase === "done" && summary && (
                 <p className="text-[13px] text-muted-foreground">

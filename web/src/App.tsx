@@ -34,6 +34,7 @@ function View() {
 function App() {
   useBridgeReady();
   const dark = useSession((s) => s.dark);
+  const themeMode = useSession((s) => s.themeMode);
 
 
   useEffect(() => {
@@ -41,11 +42,14 @@ function App() {
   }, [dark]);
 
   useEffect(() => {
+    /* 只有「跟随系统」时才听系统变化，手动覆盖不会被抢回 */
+    if (themeMode !== "system") return;
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = () => useSession.getState().set({ dark: media.matches });
+    apply();   /* 首屏就要跟随系统：原来只监听变化、不读初值，暗色主题永远不生效 */
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
-  }, []);
+  }, [themeMode]);
 
   return (
     <QueryClientProvider client={queryClient}>

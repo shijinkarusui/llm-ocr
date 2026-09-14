@@ -162,7 +162,7 @@ export function SingleView() {
         </CardHeader>
         <CardContent>
           {phase === "idle" && (
-            <EmptyState icon={FileText} title="还没有结果" description="选好来源后点“开始识别”。" />
+            <EmptyState icon={FileText} tone="idle" title="还没有结果" description="选好来源后点“开始识别”。" />
           )}
           {phase === "loading" && (
             <div className="flex flex-col gap-2" aria-label="加载中">
@@ -172,7 +172,7 @@ export function SingleView() {
             </div>
           )}
           {phase === "error" && (
-            <EmptyState icon={FileText} title="识别失败" description={error} actionLabel="重试" onAction={run} />
+            <EmptyState icon={FileText} tone="error" title="识别失败" description={error} actionLabel="重试" onAction={run} />
           )}
           {phase === "done" && (
             <pre className="max-h-96 overflow-y-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs leading-5">
