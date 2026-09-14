@@ -116,7 +116,7 @@
 | Contract | `prompts/ocr_system.md`, `prompts/notation_spec.md` | Transcription rules, Unicode combining map, IPA keep-list | Code, keys |
 | Config | `src/config.py` + `.env.example` | `GlobalConfig` vs `RunConfig`, CLI>env>DEFAULT, dotenv first-import, key masking | Transport, rendering |
 | Transport | `src/llm_client.py` | 3 ingresses, passthrough `**kwargs`, `auto_vision()` 1+1, retries, endpoint normalize | OCR prompts, PDF layout |
-| Page/Batch | `src/ocr_page.py`, `src/batch_plan.py` | Single shot, thread pool + adaptive concurrency, `usage.jsonl` resume | Gateway internals |
+| Page/Batch | `src/ocr_page.py`, `src/batch_plan.py`, `src/book_id.py` | Single shot, thread pool + adaptive concurrency, `usage.jsonl` resume, per-book folder + whole-book merge, `book.json` identity | Gateway internals |
 | Render/Search | `src/render.py`, `src/make_searchable.py` | 200dpi raster, raster-bg + hidden text, box/exact vs fallback | LLM params |
 | Quality | `src/check_notation.py`, `src/postprocess.py`, `src/verify_searchable.py` | Notation gate, CJK cleanup + merge, keyword/copyable verify | Secrets |
 | UI | `web/` (Tauri 2 + React 19) + `serve.py` bridge | 5 views, typed `lib/engine.ts`, tray/single-instance/native dialogs | Engine logic |
@@ -132,8 +132,10 @@ PDF page --render.py(200dpi)--> PNG bytes
         messages:  content[{text},{image:{source:{base64|url}}}]
   --> page Markdown
   --> check_notation.py gate (0 issues)
-  --> pages/page_NNNN.md (+ usage.jsonl row: endpoint/extra/tokens)
-  --> postprocess.clean_md + merge_pages --> book.md
+  --> <output dir>/<pdf stem>/pages/page_NNNN.md
+      (+ usage.jsonl row: endpoint/extra/tokens)
+  --> postprocess.clean_md + merge_pages (end of batch)
+      --> <output dir>/<pdf stem>/<pdf stem>-ocr.md
   --> make_searchable(raster + md [+boxes]) --> book_searchable.pdf
   --> verify_searchable(keywords) --> hits / copyable chars
 ```
@@ -143,7 +145,9 @@ PDF page --render.py(200dpi)--> PNG bytes
 - `batch_plan.py`: `ThreadPoolExecutor` 1–20 (CLI default 4, lib 1; >8 warns,
   >20 rejects), semaphore adaptive halving on 429/5xx with recovery,
   cross-process file lock, `usage.jsonl` append-only — reruns skip
-  `status=success` pages automatically; `skipped` is logged too.
+  `status=success` pages automatically; `skipped` is logged too. Both the log
+  and the page files live in the per-book folder `<output dir>/<pdf stem>/`
+  (§5 batch step), so resuming a range keeps writing into the same book.
 - Retries: per-leg, 4xx fail fast (never retried), 429/5xx/timeout/`OSError`
   retried; `auto` mode = responses single-try → chat single-try on
   429/5xx/timeout/`OSError` only (1+1, no 9x explosion).
@@ -169,6 +173,7 @@ python src/ocr_page.py --image tests/cand_165.png --output out/a.md \
   --extra-json '{"temperature":0.2,"reasoning_effort":"low"}'
 python src/batch_plan.py --dry-run --endpoint responses
 python src/batch_plan.py --pdf book.pdf --output-dir out --endpoint chat
+# -> out/book/pages/page_0000.md ... and out/book/book-ocr.md (whole book)
 ```
 
 SDK-style (bypass CLI, same engine):
@@ -181,11 +186,15 @@ payload, usage = generic_request(
 )
 ```
 
-### Desktop installer
+### Portable build
 
-Windows installers (Chinese UI, NSIS + MSI) ship the engine sidecar inside the
-package — no Python needed on the target machine. After installing, open the
-**Connection** view and fill in the gateway URL, model and API key.
+Releases ship as a **portable folder** (`llm-ocr-<version>-portable/`) — there is
+no installer. Unzip and run `llm-ocr.exe`; the engine sidecar and its Python
+runtime sit next to it, so **no Python is needed on the target machine** and
+nothing is written outside the folder. Then open the **Connection** view and
+fill in the gateway URL, model and API key.
+
+Rebuild it with `pwsh -File build-portable.ps1` (see §8).
 
 ## 3. Configuration (src/config.py)
 
@@ -238,7 +247,31 @@ bare `host:port` to `http://` (with https-443 detection).
 3. **Batch** (`batch_plan.py`): thread pool + adaptive concurrency (halve on
    429/5xx, recover on success), `--dry-run` to plan first, append-only
    `usage.jsonl` (endpoint/extra/tokens; reruns skip successes, skipped pages
-   are logged), page ranges, 2 retries per failure.
+   are logged), page ranges, 2 retries per failure. The `--output-dir` you pass
+   gets one folder per book (named after the PDF, extension dropped), so
+   several books never mix:
+
+   ```
+   <output dir>/<pdf stem>/
+   ├── book.json              identity: absolute source path + size + page count
+   │                          + pages_done + artifacts (never credentials)
+   ├── <pdf stem>-ocr.md      whole-book Markdown: every pages/*.md merged
+   │                          by postprocess.merge_pages at the end of a run
+   ├── pages/page_0000.md ... one file per page (0-based in the file name)
+   └── usage.jsonl            resume log (status=success pages are skipped)
+   ```
+
+   `book.json` answers "whose page 0 is this?": it binds the folder to one PDF
+   (absolute path, size, mtime, page count, pages present on disk, artifacts),
+   so a later step can verify it is using the right book instead of guessing.
+   Re-running the same book updates it in place (idempotent: `created` and
+   unknown fields survive, `updated` and `pages_done` refresh); credential-shaped
+   keys and values are stripped on every read *and* write.
+
+   The merge is not a plain concatenation — `merge_pages` runs `clean_md` per
+   page, so CJK punctuation normalization happens there too. It always merges
+   *what exists on disk*, not just this run's page range, so segmented reruns
+   keep growing the same `<pdf stem>-ocr.md`.
 4. **Notation gate** (`check_notation.py`): the machine form of
    `prompts/notation_spec.md` — rejects ASCII substitutes like `[t_w]`/`[tw]`/
    `[kh]`, LaTeX residue (`\underset`/`\overset`/`$` delimiters), split or
@@ -246,7 +279,11 @@ bare `host:port` to `http://` (with https-443 detection).
 5. **Post-process** (`postprocess.py`): source is ASCII-only, Chinese
    punctuation is built from escaped code points; page footers `· n ·` become
    their own line; code fences and LaTeX are protected then restored;
-   `merge_pages` inserts `<!-- PAGE n -->` plus a head index;
+   `merge_pages(pages, title)` turns a `{page number: markdown}` mapping into
+   `# <title>` + `## Page Index` + one `<!-- PAGE n -->` block per page (pages
+   are re-cleaned through `clean_md`, empty pages become `[EMPTY PAGE]`);
+   `batch_plan.run_batch` calls it at the end of every batch, with the PDF stem
+   as `title`, writing `<output dir>/<pdf stem>/<pdf stem>-ocr.md`;
    `polish_with_llm` passes through the same three protocols.
 6. **Dual layer** (`make_searchable.py`): the page raster is the full-page
    background (size unchanged, `maxdiff=0`, no recompression); when boxes are
@@ -254,6 +291,15 @@ bare `host:port` to `http://` (with https-443 detection).
    `render_mode=3`, otherwise it falls back to a dual copy (a 0.5 pt
    fully-hidden copy + 8 pt spread per line) so text stays searchable and
    copyable.
+   The bridge resolves the book first (`src/book_id.py`): pointing at a book
+   folder uses its own `book.json` (and fills in the source PDF, so you need not
+   pick it again); pointing at a parent directory requires exactly one book to
+   match the chosen PDF (same path, or same size + page count when the file was
+   moved); no match or several matches is a hard refusal that lists the
+   candidates — never a silent pick. A dir without `book.json` still works as
+   before and gets its identity file written on the first successful build. The
+   dual-layer PDF lands inside the book folder, then its name is recorded in
+   `artifacts.searchable_pdf`.
 7. **Verify** (`verify_searchable.py`): `verify(pdf, keywords)` reports
    per-page keyword hits plus total copyable characters; `compare_md` diffs
    two Markdown files with difflib.
@@ -286,33 +332,103 @@ pipe is preferred).
 
 ## 8. Packaging
 
-`serve.spec` (PyInstaller onefile, `console=False`): `pathex` covers root and
+Releases are **portable only**; `bundle.targets` is `[]`, so Tauri produces no
+NSIS/MSI artifacts. `build-portable.ps1` runs the whole chain and is the only
+supported way to cut a release:
+
+```
+PyInstaller onedir  ->  refresh externalBin  ->  pnpm tauri build --no-bundle
+                    ->  sidecar smoke test   ->  assemble  ->  zip
+```
+
+`serve.spec` (PyInstaller **onedir**, `console=False`): `pathex` covers root and
 `src/`; `datas` carries `prompts/*.md` plus `tests/cand_165.png` (resolved in
 the frozen app through `sys._MEIPASS` via `serve._res_file`); `hiddenimports`
-lists every engine module; `excludes` keeps it around 45 MB. Tauri bundles it
-via `externalBin: binaries/serve`, producing NSIS (currentUser) and MSI
-artifacts.
+lists every engine module — including `book_id`, which `serve.py` imports lazily
+inside a function, so it must be listed explicitly even though the static module
+graph usually finds it.
 
-The sidecar is a **PyInstaller onefile**, i.e. a bootloader parent plus the
-real Python child. The child is what holds `127.0.0.1:21139` and the lock file,
-so the shell terminates the whole job object rather than just the bootloader.
-It also sweeps leftover `%TEMP%\_MEI*` extraction directories on startup and on
-exit (only directories that carry this project's own marker file; foreign
-PyInstaller directories are never candidates).
+The result is:
+
+```
+llm-ocr-<version>-portable/
+├── llm-ocr.exe     Tauri shell (frontend assets embedded in the exe)
+├── serve.exe       engine sidecar
+└── _internal/      Python runtime and support files
+```
+
+`.gitignore` excludes `dist-portable/`.
+
+**Why onedir and not onefile.** A onefile sidecar re-extracts itself into
+`%TEMP%\_MEI*` (about 90 MB) on every launch. Because the shell terminates the
+sidecar with a Job Object, the bootloader never gets to clean up, so every run
+leaked one directory — one machine had accumulated 116 of them, 9.96 GB. With
+onedir there is no extraction at all and the leak is gone at the root. The shell
+still sweeps stale `%TEMP%\_MEI*` directories on startup and exit, but that is
+now only housekeeping for leftovers from older versions; it touches only
+directories carrying this project's own marker file, so foreign PyInstaller
+directories are never candidates.
+
+**Never ship a bare `cargo build --release`.** It omits the
+`tauri/custom-protocol` feature and yields a dev-mode binary that loads
+`localhost:1420` with the frontend not embedded. `pnpm tauri build` (with or
+without `--no-bundle`) enables it. Quick check: a production `llm-ocr.exe`
+contains the string `theme-init.js`.
+
+The Job Object still matters with onedir: the sidecar is now a single process,
+but `kill_sidecar()` only runs on `RunEvent::ExitRequested`, so a force-killed
+shell would otherwise leave the engine holding port 21139. `KILL_ON_JOB_CLOSE`
+covers that case.
 
 ## 9. Security & limits
 
 - The key never enters the repository (`.gitignore`: `.env / out/ /
   __pycache__ / dist/ / build*`); do not put secrets in `--extra-json`.
-- `out/` holds local run artifacts (book/pages/usage.jsonl/dual-layer PDF) and
-  is not published with the repo.
+- `out/` holds local run artifacts (`out/<pdf stem>/` per book: pages/,
+  usage.jsonl, `<pdf stem>-ocr.md`, dual-layer PDF) and is not published with
+  the repo.
 - `tests/` sample images are small debug fixtures; bring your own book PDF
   (`OCR_PDF_PATH` or `--pdf`).
 - `src/conn_test.py` is a placeholder with no business logic.
 
 ## 10. Changelog
 
+### 0.6.3 — per-book output folders, identity binding, portable releases
+
+- **Each book gets its own folder.** Batch output now lands in
+  `<outdir>/<pdf stem>/`, holding `pages/`, `usage.jsonl`, the merged
+  `<pdf stem>-ocr.md` and the dual-layer PDF. Two books can no longer be
+  confused — which was the real failure mode: a `page_0000.md` on its own does
+  not say which book it came from.
+- **`book.json` binds OCR results to their source PDF.** Written by the batch
+  job (absolute source path, page count, size, mtime, pages done, artifacts),
+  and it deliberately records **no** base URL and no credential of any kind. The
+  dual-layer step reads it: point at a book folder and the source PDF is filled
+  in for you; point at a parent directory and your chosen PDF is matched against
+  the books underneath. Ambiguous or mismatched input **fails loudly with the
+  candidate list** rather than silently using the wrong book. Directories
+  written before this version keep working and gain a `book.json` the first time
+  a dual-layer build succeeds in them.
+- **The whole-book Markdown is actually produced.** `postprocess.merge_pages`
+  existed but was never called anywhere; batch now merges every page present on
+  disk into `<pdf stem>-ocr.md`, so resuming across several runs still
+  accumulates one complete book. Both READMEs now describe what the code does
+  instead of a flow that was never wired up.
+- **Portable releases, no installers.** A portable folder plus zip replaces the
+  NSIS/MSI artifacts — see §8.
+- **The sidecar moved to onedir**, which removes the per-run `%TEMP%`
+  extraction entirely — see §8.
+- The batch view reports the merged Markdown path when a run finishes. The
+  dual-layer view's verification-keyword field now defaults to empty and
+  explains what the keywords actually do.
+
 ### 0.6.2 — engine connectivity, lifecycle and installer fixes
+
+Also in this build: batch output now lands in a per-book folder
+(`<output dir>/<pdf stem>/` with `pages/`, `usage.jsonl`, an identity file
+`book.json` and the merged `<pdf stem>-ocr.md`) — `merge_pages` used to be
+documented but never called, so a finished batch left only loose page files, and
+two books OCRed side by side were indistinguishable.
 
 Everything below was found by running the **packaged** build; none of it
 reproduces under `pnpm tauri dev`, because the Vite proxy masks the address

@@ -185,7 +185,7 @@ def cmd_batch(args: argparse.Namespace) -> int:
             total_pages = doc.page_count
         print(f"dry_run=true total_pages={total_pages} planned_pages={len(plan)} dpi={args.dpi} concurrency={args.concurrency} retries={args.retries}")
         for item in plan[:5]:
-            print(f"pno_0based={item['pno_0based']} page_number={item['page_number']} output=pages/page_{item['pno_0based']:04d}.md")
+            print(f"pno_0based={item['pno_0based']} page_number={item['page_number']} output={item['output']}")
         print(f"endpoint={ep} detail={args.detail or 'high'} base_url={args.base_url or 'env/default'} model={args.model or 'env/default'}")
         return 0
     g, r, key = _resolve_or_die(args)

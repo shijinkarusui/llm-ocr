@@ -11,6 +11,8 @@ build-v2/
 # S9/S10: new-UI build outputs (never commit binaries)
 dist-serve/
 build-serve/
+# portable release output (build-portable.ps1 -> llm-ocr-<ver>-portable\ + .zip)
+dist-portable/
 web/dist/
 web/src-tauri/target/
 web/src-tauri/binaries/

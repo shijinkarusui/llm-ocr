@@ -211,6 +211,7 @@ export function BatchView() {
                 <p className="text-[13px] text-muted-foreground">
                   完成：tokens {String(summary.total_tokens ?? "?")}，本轮失败{" "}
                   {String(summary.failed_pages_this_run ?? "?")} 页。
+                  {summary.merged_md ? ` 整本 Markdown：${String(summary.merged_md)}` : " 未合并出整本 Markdown（pages/ 下还没有页文件）。"}
                 </p>
               )}
             </>

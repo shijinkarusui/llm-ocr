@@ -183,11 +183,12 @@ def _job_cancelled(jid):
 
 
 def _run_batch_job(jid, pdf_path, outdir, kw, cleanup=None):
-    from batch_plan import run_batch
+    from batch_plan import book_output_dir, run_batch
     _job_set(jid, status="running")
     try:
         summary = run_batch(pdf_path, outdir, **kw)
-        prog = _progress_from_usage(outdir)
+        # usage.jsonl lives in the per-book folder, not directly under outdir.
+        prog = _progress_from_usage(book_output_dir(pdf_path, outdir))
         _job_set(jid, status="done", summary=summary, progress=prog)
         log("batch job %s done tokens=%s failed=%s" % (
             jid, summary.get("total_tokens", 0), summary.get("failed_pages_this_run", 0)))
@@ -202,17 +203,17 @@ def _run_batch_job(jid, pdf_path, outdir, kw, cleanup=None):
                 pass
 
 
-def _run_searchable_job(jid, pdf_path, outdir, geo_source, keywords):
+def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords, book_dir=None):
     import fitz
     from make_searchable import make_searchable
     from verify_searchable import verify
     _job_set(jid, status="running")
     try:
-        root = Path(outdir)
-        pages = sorted(root.glob("pages/page_*.md"),
+        root = Path(out_dir)
+        pages = sorted(Path(pages_dir).glob("page_*.md"),
                        key=lambda p: int(p.stem.split("_")[1]))
         if not pages:
-            raise ValueError("no pages/page_*.md under %s" % outdir)
+            raise ValueError("no pages/page_*.md under %s" % pages_dir)
         md = {int(p.stem.split("_")[1]): p.read_text(encoding="utf-8") for p in pages}
         with fitz.open(str(pdf_path)) as doc:
             total = doc.page_count
@@ -225,6 +226,17 @@ def _run_searchable_job(jid, pdf_path, outdir, geo_source, keywords):
                "copyable_chars": (res or {}).get("copyable_chars", "?"),
                "hit_pages": (res or {}).get("hit_pages", []),
                "hit_page_count": len((res or {}).get("hit_pages", []))}
+        if book_dir:
+            # Keep the book folder self-describing: record the artifact we just made.
+            # For a legacy dir (no book.json yet) this also writes the missing
+            # identity fields, so the folder becomes verifiable from now on.
+            try:
+                from book_id import book_json_path, update_book
+                update_book(book_dir, source_pdf=pdf_path, page_count=total,
+                            searchable_pdf=target.name)
+                out["book_json"] = str(book_json_path(book_dir))
+            except Exception as exc:  # noqa: BLE001
+                out["book_json_error"] = "%s: %s" % (type(exc).__name__, exc)
         _job_set(jid, status="done", result=out)
         log("searchable job %s done pages=%d" % (jid, total))
     except Exception as exc:  # noqa: BLE001
@@ -309,7 +321,8 @@ class Handler(BaseHTTPRequestHandler):
                 out = {k: v for k, v in job.items() if k != "cancel"}
                 if job.get("kind") == "batch" and job.get("status") == "running":
                     try:
-                        out["progress"] = _progress_from_usage(job.get("outdir") or "")
+                        out["progress"] = _progress_from_usage(
+                            job.get("book_dir") or job.get("outdir") or "")
                     except Exception:
                         pass
                 self._send(200, out)
@@ -341,6 +354,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_batch_run(data)
             elif path == "/api/searchable/build":
                 self._handle_searchable(data)
+            elif path == "/api/book/resolve":
+                self._handle_book_resolve(data)
             elif path == "/api/notation/check":
                 self._handle_notation(data)
             elif path == "/api/file/b64":
@@ -445,7 +460,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_dry_run(self, data):
         import fitz
-        from batch_plan import page_plan
+        from batch_plan import book_output_dir, page_plan
         pdf = (data.get("pdf_path") or "").strip()
         if not pdf or not Path(pdf).is_file():
             self._send(400, {"error": "pdf_path must be an existing file"})
@@ -458,9 +473,12 @@ class Handler(BaseHTTPRequestHandler):
         with fitz.open(str(pdf)) as doc:
             total = doc.page_count
         first5 = [{"pno_0based": i["pno_0based"], "page_number": i["page_number"]} for i in plan[:5]]
-        self._send(200, {"total_pages": total, "planned_pages": len(plan), "first5": first5})
+        # Per-book root the run will actually write to (pages/, usage.jsonl, book md).
+        self._send(200, {"total_pages": total, "planned_pages": len(plan), "first5": first5,
+                         "book_dir": str(book_output_dir(Path(pdf), Path(outdir)))})
 
     def _handle_batch_run(self, data):
+        from batch_plan import book_output_dir
         pdf = (data.get("pdf_path") or "").strip()
         if not pdf or not Path(pdf).is_file():
             self._send(400, {"error": "pdf_path must be an existing file"})
@@ -490,29 +508,72 @@ class Handler(BaseHTTPRequestHandler):
                   api_key=llm["api_key"], endpoint=data.get("endpoint") or "responses",
                   detail=llm["detail"], extra=extra, timeout=data.get("timeout"))
         jid = _new_job("batch", "batch %s" % Path(pdf).name)
-        _job_set(jid, outdir=outdir)
+        _job_set(jid, outdir=outdir, book_dir=str(book_output_dir(Path(pdf), Path(outdir))))
         threading.Thread(target=_run_batch_job,
                          args=(jid, pdf, outdir, kw, cleanup), daemon=True).start()
         log("batch job %s started pdf=%s key=%s" % (jid, pdf, masked_key(llm["api_key"])))
         self._send(200, {"job_id": jid})
 
     def _handle_searchable(self, data):
+        from batch_plan import book_output_dir
+        from book_id import resolve_book
         pdf = (data.get("pdf_path") or "").strip()
         outdir = (data.get("outdir") or "").strip()
-        if not pdf or not Path(pdf).is_file():
-            self._send(400, {"error": "pdf_path must be an existing file"})
-            return
         if not outdir or not Path(outdir).is_dir():
             self._send(400, {"error": "outdir must contain pages/page_*.md"})
+            return
+        if pdf and not Path(pdf).is_file():
+            self._send(400, {"error": "pdf_path must be an existing file"})
+            return
+        # Bind the folder to a book before building anything: guessing here would
+        # silently lay one book's OCR onto another book's raster.
+        resolved = resolve_book(
+            outdir, pdf or None,
+            book_dir_hint=book_output_dir(pdf, outdir) if pdf else None,
+        )
+        if resolved["status"] in ("error", "not_found", "ambiguous", "mismatch"):
+            self._send(400, {"error": resolved["message"], "status": resolved["status"],
+                             "candidates": resolved.get("candidates") or []})
+            return
+        pdf_use = resolved.get("source_pdf") or pdf
+        if not pdf_use or not Path(pdf_use).is_file():
+            self._send(400, {"error": "无法确定源 PDF：该目录没有 book.json 记录源文件，请手动选择原 PDF"})
+            return
+        pages_dir = resolved.get("pages_dir") or str(Path(outdir) / "pages")
+        if not Path(pages_dir).is_dir():
+            self._send(400, {"error": "目录里没有 pages/*.md：%s" % pages_dir})
             return
         geo = (data.get("geo_source") or "auto").strip()
         kws = data.get("keywords") or []
         if isinstance(kws, str):
             kws = [k.strip() for k in kws.replace("\uff0c", ",").split(",") if k.strip()]
-        jid = _new_job("searchable", "searchable %s" % Path(pdf).name)
+        job_book_dir = resolved.get("book_dir") or outdir
+        jid = _new_job("searchable", "searchable %s" % Path(pdf_use).name)
+        _job_set(jid, outdir=outdir, book_dir=resolved.get("book_dir"),
+                 source_pdf=pdf_use, bind_status=resolved["status"],
+                 warnings=resolved.get("warnings") or [])
         threading.Thread(target=_run_searchable_job,
-                         args=(jid, pdf, outdir, geo, kws), daemon=True).start()
-        self._send(200, {"job_id": jid})
+                         args=(jid, pdf_use, pages_dir, job_book_dir, geo, kws,
+                               resolved.get("book_dir")), daemon=True).start()
+        log("searchable job %s started pdf=%s bind=%s" % (jid, pdf_use, resolved["status"]))
+        self._send(200, {"job_id": jid, "status": resolved["status"],
+                         "book_dir": resolved.get("book_dir"), "source_pdf": pdf_use,
+                         "warnings": resolved.get("warnings") or []})
+
+    def _handle_book_resolve(self, data):
+        """Bind a directory (book folder / legacy OCR dir / parent dir) to one book."""
+        from batch_plan import book_output_dir
+        from book_id import resolve_book
+        outdir = (data.get("dir") or data.get("outdir") or "").strip()
+        pdf = (data.get("pdf_path") or "").strip()
+        if not outdir:
+            self._send(400, {"error": "dir is required"})
+            return
+        resolved = resolve_book(
+            outdir, pdf or None,
+            book_dir_hint=book_output_dir(pdf, outdir) if pdf else None,
+        )
+        self._send(200, resolved)
 
     def _handle_file_b64(self, data):
         p = (data.get("path") or "").strip()

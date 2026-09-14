@@ -160,13 +160,48 @@ export function jobCancel(id: string): Promise<{ ok: boolean }> {
   return req<{ ok: boolean }>(`/api/jobs/${id}/cancel`, { method: "POST", body: "{}" });
 }
 
-export interface SearchableRunRes { job_id: string }
+export interface SearchableRunRes {
+  job_id: string;
+  status?: BookBindStatus;
+  book_dir?: string | null;
+  source_pdf?: string | null;
+  warnings?: string[];
+}
 export function searchableBuild(
   pdfPath: string, outdir: string, geoSource: string, keywords: string[],
 ): Promise<SearchableRunRes> {
   return req<SearchableRunRes>("/api/searchable/build", {
     method: "POST",
     body: JSON.stringify({ pdf_path: pdfPath, outdir, geo_source: geoSource, keywords }),
+  });
+}
+
+/** Which book a folder belongs to, per its book.json (see src/book_id.py). */
+export type BookBindStatus = "bound" | "unbound" | "ambiguous" | "not_found" | "mismatch" | "error";
+export interface BookCandidate {
+  book_dir: string;
+  source_name: string;
+  source_pdf: string | null;
+  page_count: number | null;
+  pages_done: number | null;
+  updated?: string | null;
+}
+export interface BookResolveRes {
+  status: BookBindStatus;
+  book_dir: string | null;
+  pages_dir: string | null;
+  source_pdf: string | null;
+  recorded_pdf: string | null;
+  record: Record<string, unknown> | null;
+  candidates: BookCandidate[];
+  warnings: string[];
+  message: string;
+}
+/** Bind an output dir (book folder / legacy dir / parent dir) to exactly one book. */
+export function bookResolve(dir: string, pdfPath?: string): Promise<BookResolveRes> {
+  return req<BookResolveRes>("/api/book/resolve", {
+    method: "POST",
+    body: JSON.stringify({ dir, pdf_path: pdfPath ?? "" }),
   });
 }
 

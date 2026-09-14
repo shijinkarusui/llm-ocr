@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -36,6 +37,16 @@ except ImportError:
         from llm_client import anthropic_vision, chat_vision, responses_vision
         auto_vision = None  # type: ignore  # test injection: tests may set batch_plan.auto_vision
     from render import render_page
+
+try:
+    from .postprocess import merge_pages
+except ImportError:
+    from postprocess import merge_pages  # type: ignore
+
+try:
+    from .book_id import book_json_path, page_numbers, pdf_page_count, update_book
+except ImportError:
+    from book_id import book_json_path, page_numbers, pdf_page_count, update_book  # type: ignore
 
 try:
     from .config import resolve_config
@@ -71,6 +82,83 @@ DEFAULT_CONCURRENCY = 1
 DEFAULT_RETRIES = 2
 _APPEND_LOCK = threading.Lock()
 SCHEMA_VERSION = 1
+_PAGE_FILE_RE = re.compile(r"^page_(\d+)\.md$")
+# Windows-illegal filename chars: a PDF name must never break the book folder.
+_BAD_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+# Windows device names cannot be used as directories, even with an extension gone.
+_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _book_stem(pdf_path: str | Path) -> str:
+    """Book title = PDF file name without its extension (last dotted segment only).
+
+    `Path.stem` handles spaces / CJK / multi-dot names: "a.b.pdf" -> "a.b";
+    illegal Windows path characters are replaced, a trailing dot is dropped and
+    reserved device names are suffixed.
+    """
+    stem = _BAD_NAME_CHARS.sub("_", Path(pdf_path).stem).strip().rstrip(".")
+    if stem.upper() in _RESERVED_NAMES:
+        stem = f"{stem}_book"
+    return stem or "book"
+
+
+def book_output_dir(pdf_path: str | Path, output_dir: str | Path) -> Path:
+    """Per-book root: `<output_dir>/<pdf stem>` (created lazily, reused if present).
+
+    Keeps several books in one OCR output dir from mixing into a single `pages/`.
+    """
+    return Path(output_dir) / _book_stem(pdf_path)
+
+
+def _collect_book_pages(pages_dir: str | Path) -> dict[int, str]:
+    """Read every `page_<n>.md` that actually exists under `pages_dir`.
+
+    Keys are 1-based page numbers for `merge_pages` (file `page_0000.md` -> page 1),
+    so a segmented resume naturally accumulates into one whole-book mapping.
+    Unreadable or non-numeric `page_*.md` files are skipped.
+    """
+    source = Path(pages_dir)
+    pages: dict[int, str] = {}
+    if not source.is_dir():
+        return pages
+    for path in sorted(source.glob("page_*.md")):
+        match = _PAGE_FILE_RE.match(path.name)
+        if match is None:
+            continue
+        try:
+            pages[int(match.group(1)) + 1] = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue  # a broken page file must not sink the whole book
+    return pages
+
+
+def merge_book_markdown(
+    pdf_path: str | Path,
+    book_root: str | Path,
+    *,
+    pages_dir: str | Path | None = None,
+) -> Path | None:
+    """Merge existing page files into `<book_root>/<pdf stem>-ocr.md`.
+
+    Reuses `postprocess.merge_pages` (which runs `clean_md` per page), so the book
+    file gets the `# <title>` / `## Page Index` / `<!-- PAGE n -->` structure and
+    CJK punctuation normalization for free. Returns None when no page file exists
+    (no empty book file is written).
+    """
+    root = Path(book_root)
+    source = Path(pages_dir) if pages_dir is not None else root / "pages"
+    pages = _collect_book_pages(source)
+    if not pages:
+        return None
+    title = _book_stem(pdf_path)
+    target = root / f"{title}-ocr.md"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(merge_pages(pages, title=title), encoding="utf-8")
+    return target
 
 
 def page_plan(
@@ -79,7 +167,11 @@ def page_plan(
     start: int = 0,
     end: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Build a deterministic plan without rendering or making network calls."""
+    """Build a deterministic plan without rendering or making network calls.
+
+    `output_dir` is the dir the user typed; page files live in
+    `<output_dir>/<pdf stem>/pages/` (see `book_output_dir`).
+    """
     import fitz
 
     with fitz.open(str(pdf_path)) as document:
@@ -89,7 +181,7 @@ def page_plan(
     stop = page_count if end is None else min(end, page_count)
     if stop < start:
         raise ValueError("end page must be greater than or equal to start")
-    pages_dir = Path(output_dir) / "pages"
+    pages_dir = book_output_dir(pdf_path, output_dir) / "pages"
     return [
         {
             "pno_0based": pno,
@@ -663,9 +755,11 @@ def run_batch(
         warnings.warn(f"concurrency {concurrency} > 8: throughput may not scale, watch p95/429", UserWarning)
     if retries < 0:
         raise ValueError("retries cannot be negative")
-    root = Path(output_dir)
+    # Per-book root: <output_dir>/<pdf stem>/ holds pages/, usage.jsonl and the
+    # merged book Markdown; page_plan resolves pages/ with the same rule.
+    root = book_output_dir(pdf_path, output_dir)
     usage_path = root / "usage.jsonl"
-    plan = page_plan(pdf_path, root, start, end)
+    plan = page_plan(pdf_path, output_dir, start, end)
     prompt = Path(prompt_path).read_text(encoding="utf-8")
     limiter = _AdaptiveLimiter(concurrency)
     results: list[dict[str, Any]] = []
@@ -712,6 +806,39 @@ def run_batch(
     summary["failed_pages_this_run"] = sum(
         result.get("status") == "failed" for result in results
     )
+    summary["book_dir"] = str(root)
+    # Whole-book Markdown from every page file on disk (not just this run's slice),
+    # so segmented resumes keep growing the same <stem>-ocr.md.
+    try:
+        merged_md = merge_book_markdown(pdf_path, root)
+    except (OSError, UnicodeDecodeError) as exc:
+        merged_md = None
+        summary["merged_md_error"] = f"{type(exc).__name__}: {exc}"
+        warnings.warn(f"merge_pages failed for {root}: {exc}", UserWarning)
+    if merged_md is not None:
+        summary["merged_md"] = str(merged_md)
+        summary["merged_pages"] = len(_collect_book_pages(root / "pages"))
+    # Identity file: binds this folder to its source PDF, so the dual-layer step
+    # can prove it is using the right book instead of guessing. Credential-free.
+    try:
+        effective = _resolve_run(base_url=base_url, model=model, api_key=api_key,
+                                 endpoint=endpoint, detail=detail, system=system,
+                                 timeout=timeout)
+        record = update_book(
+            root,
+            source_pdf=pdf_path,
+            page_count=pdf_page_count(pdf_path),
+            pages_done=page_numbers(root / "pages"),
+            merged_md=merged_md.name if merged_md is not None else None,
+            model=effective.get("model"),
+            endpoint=effective.get("requested"),
+        )
+        summary["book_json"] = str(book_json_path(root))
+        summary["book_source_pdf"] = record.get("source_pdf")
+        summary["book_pages_done"] = len(record.get("pages_done") or [])
+    except Exception as exc:  # noqa: BLE001 - identity write must not sink a finished batch
+        summary["book_json_error"] = f"{type(exc).__name__}: {exc}"
+        warnings.warn(f"book.json write failed for {root}: {exc}", UserWarning)
     if base_url:
         summary["base_url"] = base_url
     if model:
@@ -737,9 +864,10 @@ def _print_dry_run(
         f"dpi={dpi} concurrency={concurrency} retries={retries}"
     )
     for item in items[:5]:
+        # Real destination (already includes the per-book folder), not a guess.
         print(
             f"pno_0based={item['pno_0based']} page_number={item['page_number']} "
-            f"output=pages/page_{item['pno_0based']:04d}.md"
+            f"output={item['output']}"
         )
 
 
@@ -779,6 +907,8 @@ def main() -> int:
         with fitz.open(str(args.pdf)) as document:
             total_pages = document.page_count
         _print_dry_run(plan, total_pages, args.dpi, args.concurrency, args.retries)
+        _book = book_output_dir(args.pdf, args.output_dir)
+        print(f"book_dir={_book} merged_md={_book / (_book_stem(args.pdf) + '-ocr.md')}")
         print(f"endpoint={args.endpoint} detail={args.detail} base_url={args.base_url or 'env/default'} model={args.model or 'env/default'}")
         if extra:
             print(f"extra={json.dumps(extra, ensure_ascii=True)[:400]}")
