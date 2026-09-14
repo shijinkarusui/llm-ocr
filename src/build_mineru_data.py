@@ -15,24 +15,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = ROOT / "out"
-PART1 = Path(
-    r"F:\DSH工作区\mineru-results\part1\e8a095c9-594c-4c9a-b06b-f766b4d30bb1_content_list.json"
-)
-PART2 = Path(
-    r"F:\DSH工作区\mineru-results\part2\87a61508-e876-46a8-a121-939cc43ec109_content_list.json"
-)
+# MinerU results live outside the repo (large artifacts, not tracked). Point
+# ``LLM_OCR_MINERU_DIR`` at your own ``mineru-results`` directory; the default
+# keeps the original layout for a checkout that sits next to it.
+MINERU_DIR = Path(os.environ.get("LLM_OCR_MINERU_DIR", ROOT.parent / "mineru-results"))
+PART1 = MINERU_DIR / "part1" / "e8a095c9-594c-4c9a-b06b-f766b4d30bb1_content_list.json"
+PART2 = MINERU_DIR / "part2" / "87a61508-e876-46a8-a121-939cc43ec109_content_list.json"
 PART2_OFFSET = 200
-MODEL1 = Path(
-    r"F:\DSH工作区\mineru-results\part1\e8a095c9-594c-4c9a-b06b-f766b4d30bb1_model.json"
-)
-MODEL2 = Path(
-    r"F:\DSH工作区\mineru-results\part2\87a61508-e876-46a8-a121-939cc43ec109_model.json"
-)
+MODEL1 = MINERU_DIR / "part1" / "e8a095c9-594c-4c9a-b06b-f766b4d30bb1_model.json"
+MODEL2 = MINERU_DIR / "part2" / "87a61508-e876-46a8-a121-939cc43ec109_model.json"
 
 
 def _iter_table_cells(row_html: str) -> list[tuple[str, int, int]]:

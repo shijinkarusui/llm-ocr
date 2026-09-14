@@ -2,8 +2,11 @@
 
 const DIRECT = "http://127.0.0.1:21139";
 // Browser dev (http) goes through the Vite /api proxy; Tauri talks direct.
-export const ENGINE_BASE =
-  typeof window !== "undefined" && window.location.protocol.startsWith("http") ? "" : DIRECT;
+// Tauri v2 on Windows serves the app from http://tauri.localhost, whose protocol is
+// also "http:" — so the protocol alone cannot separate dev from production. Detect the
+// Tauri runtime explicitly instead.
+const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+export const ENGINE_BASE = isTauri ? DIRECT : "";
 
 export interface LlmParams {
   baseUrl: string;
@@ -18,8 +21,23 @@ async function req<T>(path: string, init?: RequestInit, apiKey?: string): Promis
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (init?.headers) Object.assign(headers, init.headers);
   if (apiKey) headers["X-LLM-Key"] = apiKey;
-  const r = await fetch(`${ENGINE_BASE}${path}`, { ...init, headers });
-  const data = (await r.json()) as T & { error?: string };
+  const url = `${ENGINE_BASE}${path}`;
+  const r = await fetch(url, { ...init, headers });
+  // Read text first: when ENGINE_BASE points somewhere that is not serve.py (wrong
+  // port, a proxy, an HTML error page) a bare r.json() throws "SyntaxError:
+  // Unexpected token '<'", which hides the real problem. Decode defensively and
+  // report what actually came back.
+  const text = await r.text();
+  let data: T & { error?: string };
+  try {
+    data = JSON.parse(text) as T & { error?: string };
+  } catch {
+    throw new Error(
+      `响应不是 JSON: HTTP ${r.status}${r.statusText ? " " + r.statusText : ""} ${url} ` +
+        `content-type=${r.headers.get("content-type") ?? "(none)"} ` +
+        `body=${JSON.stringify(text.slice(0, 200))}`,
+    );
+  }
   if (!r.ok) throw new Error(data.error ?? `HTTP ${r.status}`);
   return data;
 }

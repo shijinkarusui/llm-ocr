@@ -1,8 +1,12 @@
 /** Native file dialogs in Tauri, <input type=file> fallback in browser dev. */
 
+/** Tauri v2 on Windows serves the app from http://tauri.localhost, whose protocol is
+ *  also "http:" — so location.protocol cannot tell production from browser dev. Detect
+ *  the runtime explicitly, with the same predicate lib/engine.ts uses (keeping one
+ *  detection scheme in the codebase rather than two). */
 export function isTauri(): boolean {
   if (typeof window === "undefined") return false;
-  return window.location.protocol === "tauri:" || window.location.protocol === "asset:";
+  return "__TAURI_INTERNALS__" in window;
 }
 
 export async function pickFile(filters?: { name: string; extensions: string[] }[]): Promise<string | null> {

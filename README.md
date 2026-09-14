@@ -1,12 +1,12 @@
 # llm-ocr
 
+**English** · [简体中文](README.zh-CN.md)
+
 > Vision-LLM OCR toolchain for scanned Chinese phonetics textbooks: per-page
 > Markdown transcription (IPA-safe) + raster-backed searchable dual-layer PDF,
 > driven by any OpenAI-compatible gateway. Desktop app (Tauri 2 + React 19,
 > engine sidecar over HTTP) and CLI share one engine. API key lives in
 > memory/env only — never in git.
-
-English overview first; full Chinese manual below (Chapters 1-9).
 
 ---
 
@@ -23,7 +23,7 @@ English overview first; full Chinese manual below (Chapters 1-9).
   `chat/completions`, `responses`, `messages` all supported, arbitrary
   official fields pass straight through (`**kwargs` / `--extra-json`).
 - **Key hygiene**: `LLM_OCR_KEY` (also `LLM_OCR_API_KEY`/`OCTOPUS_API_KEY`),
-  `.env` autoload, `Key never in git` (`.gitignore` enforces it).
+  `.env` autoload, never in git (`.gitignore` enforces it).
 
 ## 1. Architecture
 
@@ -88,8 +88,8 @@ English overview first; full Chinese manual below (Chapters 1-9).
  | -> *_vision()      | | recover, dry-run | | layer invisible;    |
  | -> page MD         | | plan, usage.jsonl| | boxes reliable ->   |
  |                    | | append (resume), | | render_mode=3 exact |
- +----------+---------+ | skipped logged   | | else fallback dual  |
-            |           +---------+--------+ | copy (full-hidden   |
+ |                    | | skipped logged   | | else fallback dual  |
+ +----------+---------+ +---------+--------+ | copy (full-hidden   |
             |                     |          | + per-line spread)   |
  +----------v---------+ +---------v--------+ +-----------v---------+
  | check_notation.py  | | postprocess.py   | | verify_searchable.py|
@@ -142,8 +142,8 @@ PDF page --render.py(200dpi)--> PNG bytes
 
 - `batch_plan.py`: `ThreadPoolExecutor` 1–20 (CLI default 4, lib 1; >8 warns,
   >20 rejects), semaphore adaptive halving on 429/5xx with recovery,
-  cross-process file lock (`msvcrt`/`fcntl`), `usage.jsonl` append-only —
-  reruns skip `status=success` pages automatically; `skipped` is logged too.
+  cross-process file lock, `usage.jsonl` append-only — reruns skip
+  `status=success` pages automatically; `skipped` is logged too.
 - Retries: per-leg, 4xx fail fast (never retried), 429/5xx/timeout/`OSError`
   retried; `auto` mode = responses single-try → chat single-try on
   429/5xx/timeout/`OSError` only (1+1, no 9x explosion).
@@ -152,11 +152,11 @@ PDF page --render.py(200dpi)--> PNG bytes
 
 ```bash
 pip install -r requirements.txt        # python-dotenv + PyMuPDF
-cp .env.example .env                  # fill in LLM_OCR_KEY (never commit .env)
-python serve.py                       # engine bridge (:21139)
-cd web && pnpm dev                  # frontend (:1420)
-# 或联调：pnpm tauri dev（Rust 拉起 serve sidecar）
-python -m src.cli models              # list gateway models
+cp .env.example .env                   # fill in LLM_OCR_KEY (never commit .env)
+python serve.py                        # engine bridge (:21139)
+cd web && pnpm dev                     # frontend (:1420)
+# or integrated: pnpm tauri dev (Rust spawns the serve sidecar)
+python -m src.cli models               # list gateway models
 python -m src.cli probe --image tests/cand_165.png
 ```
 
@@ -177,154 +177,179 @@ SDK-style (bypass CLI, same engine):
 from llm_client import generic_request
 payload, usage = generic_request(
     {"messages": [{"role": "user", "content": "hi"}], "temperature": 0.2},
-    endpoint="chat",   # chat | responses | messages (or full /v1/... path)
+    endpoint="chat",   # chat | responses | messages (or a full /v1/... path)
 )
 ```
 
----
+### Desktop installer
 
-# llm-ocr 中文手册
+Windows installers (Chinese UI, NSIS + MSI) ship the engine sidecar inside the
+package — no Python needed on the target machine. After installing, open the
+**Connection** view and fill in the gateway URL, model and API key.
 
-## 1. 项目定位
+## 3. Configuration (src/config.py)
 
-扫描版中文语音学教材的 Vision-LLM OCR 工具链：逐页高精度 Markdown 转录
-（IPA 原样、附加符号 Unicode 组合正确）+ 原尺寸光栅垫底的双层可搜索 PDF。
-桌面应用（Tauri 2 + React 19）经 `serve.py` 桥接调用同一套 `src/` 引擎，
-网关只要求 OpenAI 兼容（`chat / responses / messages` 三入站全开即可，
-实测为 Octopus 网关；OpenAI / AxonHub 同协议可直接换）。
+- `GlobalConfig`: `base_url / model / key / timeout` (where to talk).
+- `RunConfig`: `endpoint / detail / concurrency / dpi / retries / system /
+  extra` (how to talk).
+- Priority: `CLI flag > env > DEFAULT`; `dpi/retries` are CLI-only (no env
+  fallback); `LLM_OCR_PORT` is deprecated (warns and is ignored — `base_url`
+  is the only endpoint knob).
+- CLI defaults to `endpoint=responses` / concurrency 4; the library defaults
+  to `chat` / concurrency 1 (`ns.is_cli` distinguishes them).
+- Key hygiene: read only from `api_key / --key-stdin / LLM_OCR_KEY /
+  LLM_OCR_API_KEY / OCTOPUS_API_KEY / OCTOPUS_KEY`; `check()` prints a masked
+  length only.
 
-核心设计取舍：
+`.env.example` doubles as the contract: `LLM_OCR_BASE_URL` must be the `/v1`
+root (not `/v1/chat/completions`); on Octopus the model is a group name (the
+`OC/` prefix is required — a bare name returns 400); other official fields go
+through `--extra-json`.
 
-- **引擎与界面分离**：`src/` 不 import 任何 UI；前端经强类型 `lib/engine.ts`
-- **配置双轨**：`GlobalConfig{base_url,model,key,timeout}` vs
-  `RunConfig{endpoint,detail,concurrency,dpi,retries,system,extra}`，
-  优先级 CLI > 环境变量 > 默认值；Key 只驻内存，`write_env()` 永不写明文，
-  日志只打 `sk-**** + key_len`。
-- **全透传**：`generic_request + **kwargs / --extra-json`，任意官方字段直达
-  网关 body，`model/stream` 除外；不写死 temperature / max_tokens。
-- **旧文字层绝不复用**：扫描书自带文字层多为乱码，一律丢弃，以原页光栅重建。
+## 4. Transport (src/llm_client.py)
 
-## 2. 目录结构
+Three API layers, from raw to convenient:
 
-```
-llm-ocr/
-  serve.py              # 引擎桥接（stdlib HTTP，127.0.0.1:21139，job 制）
-  serve.spec            # serve.exe 打包配置（约 45MB onefile）
-  web/                  # Tauri 2 + React 19 新前端（见 spec-new-ui.md）
-  src/                  # 引擎层
-    config.py           # 中央配置（Global/Run 双 dataclass，dotenv 首句加载）
-    llm_client.py       # 三协议传输核心（982 行，见第 4 章）
-    ocr_page.py         # 单页 OCR（image / pdf-page / image-url）
-    batch_plan.py       # 批量（线程池/自适应并发/dry-run/usage.jsonl）
-    render.py           # PyMuPDF 按页渲染 PNG（默认 200dpi）
-    make_searchable.py  # 双层 PDF（光栅背景 + 隐藏文字层）
-    postprocess.py      # clean_md（中文标点/页脚/公式保护）+ merge_pages
-    check_notation.py   # 标号门禁（禁 ASCII 替代、LaTeX 残留、未配对括号）
-    verify_searchable.py# 成品验证（关键词命中页/可复制字数/compare_md）
-    cli.py              # 统一入口 models/probe/ocr/batch/config/--tui
-    cli_common.py       # flag 单源 add_llm_args（各入口共用）
-    interactive.py      # shim：转调 cli.main（解 import 环）
-    conn_test.py        # 占位小脚本（print 123）
-  prompts/
-    ocr_system.md       # OCR 系统提示词（转录 8 条 + 附加符号识读最高优先级）
-    notation_spec.md    # Unicode 组合规范 + IPA 保留清单 + 校验要点
-  tests/                # 样张 cand_165/166/167.png + page21_150.png 等
-  requirements.txt      # python-dotenv + PyMuPDF（仅此两个运行时依赖）
-  .env.example          # 可配 URL 契约文档（.env 本体 git-ignored）
-  out/                  # 运行产物目录（git-ignored；随仓库只留 gui_redesign 报告）
-```
+1. `generic_request(endpoint, body, **kw)` — you build any legal JSON; it only
+   injects `model/base_url/key` before POSTing. `endpoint` accepts an alias or
+   a full `/v1/...` path.
+2. Typed entry points — `chat_completions / responses_create /
+   anthropic_messages` (all pass `**kwargs` straight into the body).
+3. Vision helpers — `chat_vision / responses_vision / anthropic_vision`
+   (local PNG is base64'd first) and `chat_vision_url /
+   responses_vision_url / anthropic_vision_url` (remote https fetched by the
+   gateway, no base64); `detail: high|low|auto` (`high` recommended for IPA).
+4. `auto_vision()` — responses single try, falling back to chat single try
+   **only** on 429/5xx/timeout/OSError (1+1); 400/401/403/404 raise directly.
 
-## 3. 配置体系（src/config.py）
+Reliability: `HttpError` separates retryable from fail-fast; POST timeout 90 s
+(`--timeout`), `GET /v1/models` fixed at 15 s single try; `Retry-After` capped
+at 60 s; `_resolve_endpoint()` prevents `/v1/v1` double-writes and upgrades a
+bare `host:port` to `http://` (with https-443 detection).
 
-- `GlobalConfig`：`base_url / model / key / timeout`（where to talk）。
-- `RunConfig`：`endpoint / detail / concurrency / dpi / retries / system /
-  extra`（how to talk）。
-- 优先级：`CLI flag > 环境变量 > DEFAULT`；`dpi/retries` 仅 CLI（无 env
-  回退）；`LLM_OCR_PORT` 已废弃（设了就 warn 并忽略，唯一旋钮是 base_url）。
-- CLI 默认 `endpoint=responses` / 并发 4；库默认 `chat` / 并发 1；
-  `ns.is_cli` 区分两者。
-- Key 卫生：只从 `api_key / --key-stdin / LLM_OCR_KEY / LLM_OCR_API_KEY /
-  OCTOPUS_API_KEY / OCTOPUS_KEY` 读；`check()` 只打印打码长度。
+## 5. OCR pipeline (page / batch / postprocess / dual-layer / verify)
 
-`.env.example` 即契约文档：`LLM_OCR_BASE_URL` 必须是 `/v1` 根
-（不是 `/v1/chat/completions`），模型在 Octopus 上是分组名（`OC/` 前缀
-必须保留，裸名 400），其余官方字段走 `--extra-json`。
+1. **Render** (`render.py`): `render_page(pdf, pno_0based, dpi=200) -> PNG
+   bytes`; 200 dpi recommended (an IPA page is ~1184x1788, ~1.1 MB base64;
+   300 dpi is ~2.4 MB and easily over the limit). Arguments are validated
+   (type / positive / in range).
+2. **Single page** (`ocr_page.py`): sources `image` / `pdf-page` /
+   `image-url`; live `--endpoint/--detail/--extra-json`; emits page Markdown.
+3. **Batch** (`batch_plan.py`): thread pool + adaptive concurrency (halve on
+   429/5xx, recover on success), `--dry-run` to plan first, append-only
+   `usage.jsonl` (endpoint/extra/tokens; reruns skip successes, skipped pages
+   are logged), page ranges, 2 retries per failure.
+4. **Notation gate** (`check_notation.py`): the machine form of
+   `prompts/notation_spec.md` — rejects ASCII substitutes like `[t_w]`/`[tw]`/
+   `[kh]`, LaTeX residue (`\underset`/`\overset`/`$` delimiters), split or
+   stray combining marks, unbalanced brackets. Target: 0 issues.
+5. **Post-process** (`postprocess.py`): source is ASCII-only, Chinese
+   punctuation is built from escaped code points; page footers `· n ·` become
+   their own line; code fences and LaTeX are protected then restored;
+   `merge_pages` inserts `<!-- PAGE n -->` plus a head index;
+   `polish_with_llm` passes through the same three protocols.
+6. **Dual layer** (`make_searchable.py`): the page raster is the full-page
+   background (size unchanged, `maxdiff=0`, no recompression); when boxes are
+   reliable (`reliable != false`) it writes them exactly with
+   `render_mode=3`, otherwise it falls back to a dual copy (a 0.5 pt
+   fully-hidden copy + 8 pt spread per line) so text stays searchable and
+   copyable.
+7. **Verify** (`verify_searchable.py`): `verify(pdf, keywords)` reports
+   per-page keyword hits plus total copyable characters; `compare_md` diffs
+   two Markdown files with difflib.
 
-## 4. 传输层（src/llm_client.py）
+## 6. Desktop app (Tauri 2 + React 19 + serve.py bridge)
 
-三层 API（由活到死）：
+- Architecture: Tauri shell (tray / single instance / window memory / native
+  dialogs) + React frontend (5 views: Connection, Single, Batch, Dual-layer,
+  Params — plus a log console and a status bar) + `serve.py` engine bridge
+  (stdlib `http.server`, `127.0.0.1:21139`, job-based long tasks).
+- The key lives in frontend memory only and reaches the bridge through the
+  request body/header; logs print `sk-**** len=N`.
+- Development: `python serve.py` (bridge) + `cd web && pnpm dev` (frontend,
+  :1420); integrated: `pnpm tauri dev`.
+- Contract: `tests/test_serve_contract.py` (health/prompt/dry-run/notation,
+  fully offline). See `spec-new-ui.md` §3 for the API contract table.
+- **Production builds must use `pnpm tauri build`.** A bare
+  `cargo build --release` omits the `tauri/custom-protocol` feature and yields
+  a dev-mode binary (loads `localhost:1420`, assets not embedded). Quick
+  check: the string `theme-init.js` is present in a production `web.exe`.
 
-1. `generic_request(endpoint, body, **kw)` —— 你拼任意合法 JSON，
-   只注入 model/base_url/key 后 POST；endpoint 可写别名或完整 `/v1/...`。
-2. 型别入口 —— `chat_completions / responses_create / anthropic_messages`
-  （均 `**kwargs` 直通 body）。
-3. 视觉便捷 —— `chat_vision / responses_vision / anthropic_vision`
-  （本地 PNG 先 base64 体感直传）及 `chat_vision_url /
-   responses_vision_url / anthropic_vision_url`（远端 https 由网关拉取，
-   免 base64）；`detail: high|low|auto`（IPA 小字推荐 high）。
-4. `auto_vision()` —— responses 单试，仅 429/5xx/timeout/OSError 回退 chat
-   单试（1+1）；400/401/403/404 直接抛。
+## 7. CLI (src/cli.py + cli_common.py)
 
-可靠性：`HttpError` 区分可重试与 fail-fast；POST 超时 90s（`--timeout` 可调），
-`GET /v1/models` 固定 15s 单试；`Retry-After` 上限 60s；
-`_resolve_endpoint()` 防 `/v1/v1` 双写，支持 bare host:port 自动补
-`http://` 与 https-443 判定。
+`python -m src.cli <models|probe|ocr|batch|config> [--tui]`;
+`add_llm_args()` is the single flag source (`--base-url/--model/--api-key/
+--key-stdin/--endpoint/--detail/--extra-json/--timeout/--system`, plus
+`--concurrency` for batch); `--key-stdin` is tri-state (api_key wins + warns /
+TTY errors / pipe reads all); `--api-key` on the command line warns (env or a
+pipe is preferred).
 
-## 5. OCR 链路（单页 / 批量 / 后处理 / 双层 / 验证）
+## 8. Packaging
 
-1. **渲染**（`render.py`）：`render_page(pdf, pno_0based, dpi=200) -> PNG
-   bytes`；推荐 200dpi（IPA 页约 1184x1788，b64 约 1.1MB；300dpi 约 2.4MB
-   易超限）；参数强校验（类型/正数/越界）。
-2. **单页**（`ocr_page.py`）：三种来源 image / pdf-page / image-url；
-   `--endpoint/--detail/--extra-json` 活参；输出页 MD。
-3. **批量**（`batch_plan.py`）：线程池 + 自适应并发（429/5xx 半减、成功回升）、
-   `--dry-run` 先看页数规划、`usage.jsonl` 追加写（含 endpoint/extra/tokens，
-   断点续跑：success 自动跳过，skipped 也记行）、起止页范围、失败重试 2 次。
-4. **标号门禁**（`check_notation.py`）：`prompts/notation_spec.md` 的机器化身 —
-   禁 `[t_w]`/`[tw]`/`[kh]` 类 ASCII 替代、禁 LaTeX 残留
-   （`\underset`/`\overset`/`$` 定界符）、禁拆分或游离的组合附加符、未配对括号。
-   门禁目标 0 issues。
-5. **后处理**（`postprocess.py`）：源码 ASCII-only，中文标点由转义码点构造；
-   页脚 `· n ·` 单独成行；代码围栏与 LaTeX 先保护后恢复；
-   `merge_pages` 页间 `<!-- PAGE n -->` + 头部索引；
-   `polish_with_llm` 同样三协议活透传。
-6. **双层**（`make_searchable.py`）：原页光栅做全页背景（尺寸不变，
-   `maxdiff=0` 无二次压缩）；boxes 可靠（`reliable≠false`）走
-   `render_mode=3` 按盒精确写入，否则 fallback 双副本
-   （0.5pt 全文隐藏副本 + 按行均匀 8pt 分布），保证可搜可复制。
-7. **验证**（`verify_searchable.py`）：`verify(pdf, keywords)` 逐页关键词命中 +
-   可复制总字数；`compare_md` 用 difflib 相似度比对两份 Markdown。
+`serve.spec` (PyInstaller onefile, `console=False`): `pathex` covers root and
+`src/`; `datas` carries `prompts/*.md` plus `tests/cand_165.png` (resolved in
+the frozen app through `sys._MEIPASS` via `serve._res_file`); `hiddenimports`
+lists every engine module; `excludes` keeps it around 45 MB. Tauri bundles it
+via `externalBin: binaries/serve`, producing NSIS (currentUser) and MSI
+artifacts.
 
-## 6. 桌面应用（Tauri 2 + React 19 + serve.py 桥接）
+The sidecar is a **PyInstaller onefile**, i.e. a bootloader parent plus the
+real Python child. The child is what holds `127.0.0.1:21139` and the lock file,
+so the shell terminates the whole job object rather than just the bootloader.
+It also sweeps leftover `%TEMP%\_MEI*` extraction directories on startup and on
+exit (only directories that carry this project's own marker file; foreign
+PyInstaller directories are never candidates).
 
-- 架构：Tauri 外壳（托盘/单实例/窗口记忆/原生对话框）+ React 前端
-  （连接/单页/批量/双层/参数 5 视图 + 日志控制台 + 状态栏）+ `serve.py`
-  引擎桥接（stdlib `http.server`，`127.0.0.1:21139`，job 制长任务）。
-- Key 只驻前端内存，经请求 body/header 进桥接；日志只打 `sk-**** len=N`。
-- 开发：`python serve.py`（桥接）+ `cd web && pnpm dev`（前端，:1420）；
-  联调：`pnpm tauri dev`（Rust 拉起 serve sidecar，失败回退 python 直跑）。
-- 契约：`tests/test_serve_contract.py`（health/prompt/dry-run/notation 全离线）。
-  详见 `spec-new-ui.md` §3 API 契约表。
-## 7. CLI（src/cli.py + cli_common.py）
+## 9. Security & limits
 
-`python -m src.cli <models|probe|ocr|batch|config> [--tui]`；
-`add_llm_args()` 是 flag 单源（`--base-url/--model/--api-key/--key-stdin/
---endpoint/--detail/--extra-json/--timeout/--system`，批量再加
-`--concurrency`）；`--key-stdin` 三态（api_key 优先 + warn / TTY 报错 /
-管道全读）；`--api-key` 明文传参会 warn（推荐 env / 管道）。
+- The key never enters the repository (`.gitignore`: `.env / out/ /
+  __pycache__ / dist/ / build*`); do not put secrets in `--extra-json`.
+- `out/` holds local run artifacts (book/pages/usage.jsonl/dual-layer PDF) and
+  is not published with the repo.
+- `tests/` sample images are small debug fixtures; bring your own book PDF
+  (`OCR_PDF_PATH` or `--pdf`).
+- `src/conn_test.py` is a placeholder with no business logic.
 
-## 8. 打包
+## 10. Changelog
 
-`serve.spec`（PyInstaller onefile，console=False）：`pathex` 覆盖根/src；
-`datas` 带 prompts/*.md + tests/cand_165.png（冻结经 `sys._MEIPASS` 由
-`serve._res_file` 解析）；`hiddenimports` 列全引擎模块；`excludes` 沿用旧
-瘦身表（约 45MB，serve.exe）。Tauri `externalBin: binaries/serve` 随包，
-NSIS（currentUser）+ MSI 双产物：setup.exe 约 46MB。
-## 9. 安全与限制
+### 0.6.2 — engine connectivity, lifecycle and installer fixes
 
-- Key 永不进仓库（`.gitignore`: `.env / out/ / __pycache__ / dist/ /
-  build*`）；`--extra-json` 不要塞密钥类字段。
-- `out/` 为本地运行产物（book/pages/usage.jsonl/双层 PDF），不随仓库发布。
-- `tests/` 样张仅为调试用小图；整书 PDF 请自行准备（`OCR_PDF_PATH` 或
-  `--pdf` 指定）。
-- `src/conn_test.py` 为占位脚本，无业务逻辑。
+Everything below was found by running the **packaged** build; none of it
+reproduces under `pnpm tauri dev`, because the Vite proxy masks the address
+resolution and the sidecar is started by hand.
+
+- **Engine URL was unreachable in production builds.** `ENGINE_BASE` decided
+  "browser vs Tauri" from `location.protocol.startsWith("http")`, but Tauri 2
+  on Windows serves the app from `http://tauri.localhost` — protocol `http:`
+  too. Every `/api/*` call therefore went to the app's own asset server and
+  came back as `index.html` (`Unexpected token '<'`). Now detected via
+  `__TAURI_INTERNALS__`. The same wrong test in `pick.ts` disabled native file
+  dialogs, so selected paths arrived as bare filenames.
+- **A zombie sidecar made the second launch unusable.** `kill_sidecar()` only
+  terminated the PyInstaller bootloader; the real child survived, kept the
+  port and the lock, and — with its stdout pipe closed — answered every
+  request with 0 bytes. The app had no way to recover. The shell now puts the
+  sidecar in a Job Object with `KILL_ON_JOB_CLOSE`, and the sidecar's logging
+  is guarded so a detached process degrades instead of going silent.
+- **Lock handling.** A lock left behind by a hard kill used to block the next
+  start forever; it now records the holder's PID and start time and is
+  reclaimed only when the holder is provably gone. Reclamation is atomic
+  (unique temp name + `os.replace` with the handle held), closing a race where
+  a loser could delete the winner's lock.
+- **Port conflicts are loud.** The bridge asserted `SO_EXCLUSIVEADDRUSE` on
+  Windows; previously a second process could silently bind the same port and
+  steal connections. A conflicting bind now exits with code 3 and a clear
+  message.
+- **Failures are visible.** Sidecar output is retained and, when the engine
+  cannot start, the concrete reason (exit code plus the tail of its stderr)
+  appears in the in-app run log and in
+  `%LOCALAPPDATA%\cn.lxm.llmocr\logs\sidecar.log`, instead of only a 15-second
+  timeout.
+- **Diagnostics.** A non-JSON response now reports HTTP status, URL,
+  content-type and the body prefix rather than a bare parse error. The CSP
+  gained `connect-src` for the bridge and Tauri IPC.
+- **Installer is Simplified Chinese** (`nsis.languages = ["SimpChinese"]`,
+  MSI `zh-CN`).
+- **`%TEMP%` no longer grows without bound.** Every run used to leak the
+  sidecar's ~93 MB extraction directory; startup and exit now sweep
+  directories that carry this project's marker (aged 90 s or more).

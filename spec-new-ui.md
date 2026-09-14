@@ -7,7 +7,7 @@
 
 ## 0. 背景与目标
 
-- 项目：`F:\DSH工作区\llm-ocr`，Vision-LLM OCR 工具链（扫描版中文教材 → Markdown + 双层可搜索 PDF）。
+- 项目：llm-ocr 仓库根，Vision-LLM OCR 工具链（扫描版中文教材 → Markdown + 双层可搜索 PDF）。
 - 引擎 `src/`（Python，37 tests 全绿）**不动**，只重写前端。
 - 新前端：Tauri 2.x 外壳 + React 19，视觉按 `out/uikit/` 四文件执行（AGENTS.md / tokens.css / checklist / ai-resources）。
 - 已用《现代汉语八百词》（764 页）验证引擎链路：离线渲染、双层构建、`responses` 真实 OCR 均通过。新 UI 验收同样用八百词 p0 做端到端。

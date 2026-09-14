@@ -10,12 +10,14 @@ import argparse
 import base64
 import binascii
 import json
+import os
+import socket
 import sys
 import threading
 import time
 import traceback
 import uuid
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
@@ -64,7 +66,30 @@ def masked_key(key):
 
 
 def log(msg):
-    print("[serve %s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
+    line = "[serve %s] %s" % (time.strftime("%H:%M:%S"), msg)
+    try:
+        print(line, flush=True)
+    except (OSError, ValueError):
+        # The Tauri shell exited and closed its end of our stdout pipe (orphaned
+        # sidecar), or sys.stdout was closed under us.  Logging must never be
+        # fatal: BaseHTTPRequestHandler.send_response() calls log_message()
+        # *before* it writes the status line, so an exception raised here aborts
+        # the response and every request comes back as 0 bytes.  Drop the line.
+        pass
+
+
+def _force_utf8_stdio():
+    """The Tauri shell decodes this process's output as UTF-8; hold up our end.
+
+    When stdout is a pipe or file rather than a console, Windows Python encodes
+    with the ANSI code page (cp936 here), so a Chinese log line would reach the
+    user's log console as replacement characters.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
 
 
 def _body(handler):
@@ -212,6 +237,15 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         log("%s %s" % (self.address_string(), fmt % args))
 
+    def log_error(self, fmt, *args):
+        # http.server writes errors straight to sys.stderr from send_error() --
+        # again *before* the status line.  Guard it like log() so a dead stderr
+        # cannot turn "400 Bad request" into an empty reply.
+        try:
+            BaseHTTPRequestHandler.log_error(self, fmt, *args)
+        except (OSError, ValueError):
+            pass
+
     def _cors(self):
         origin = self.headers.get("Origin") or ""
         allow = ""
@@ -323,7 +357,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "not found"})
         except Exception as exc:  # noqa: BLE001
             log("POST %s failed %s" % (path, exc))
-            traceback.print_exc()
+            try:
+                traceback.print_exc()
+            except (OSError, ValueError):
+                pass  # stderr gone too (orphaned process): still answer the caller
             self._send(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
 
     # ---- handlers ----
@@ -510,20 +547,337 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, {"files": len(pages), "total": total,
                          "codes": dict(codes.most_common(10)), "worst": worst[:10]})
 
+class ExclusiveHTTPServer(ThreadingHTTPServer):
+    """Bind 127.0.0.1:<port> so a second process cannot silently share it.
+
+    On Windows SO_REUSEADDR means "let me bind a port somebody else already
+    holds", and http.server sets it by default.  A foreign process squatting on
+    21139 therefore does not make serve.exe fail: both bind, the kernel hands
+    each connection to an arbitrary one, and the UI just times out at random.
+    SO_EXCLUSIVEADDRUSE makes that conflict a hard error instead.  POSIX keeps
+    SO_REUSEADDR, where it only skips the TIME_WAIT wait.
+    """
+
+    daemon_threads = True
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        HTTPServer.server_bind(self)
+
+
+def _pid_alive(pid):
+    """Best-effort "is this PID still running?" with the stdlib only.
+
+    The lock can outlive its owner: the Tauri shell kills the sidecar with
+    TerminateProcess, so Python's `finally` never runs and the lock file stays
+    behind. Deciding whether such a lock is stale needs a liveness probe.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # os.kill(pid, 0) is not a probe on Windows (it can only terminate), so
+        # ask the kernel directly; ctypes is stdlib, no third-party dependency.
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        k32 = ctypes.windll.kernel32
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            k32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, but owned by somebody else
+    except OSError:
+        return False
+    return True
+
+
+def _proc_start_time(pid):
+    """Process creation time as a Unix timestamp, or None when unavailable.
+
+    A bare PID is not an identity: Windows recycles PIDs, so a stale lock can
+    name a PID that a completely unrelated process now owns. Comparing creation
+    times tells the two apart. Windows only — elsewhere we stay conservative.
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD),
+                    ("dwHighDateTime", wintypes.DWORD)]
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.windll.kernel32
+    handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return None
+    try:
+        created, exited, kernel, user = (FILETIME(), FILETIME(), FILETIME(), FILETIME())
+        if not k32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                   ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        ticks = (created.dwHighDateTime << 32) | created.dwLowDateTime
+        if ticks == 0:
+            return None
+        # FILETIME counts 100ns intervals since 1601-01-01.
+        return (ticks - 116444736000000000) / 1e7
+    finally:
+        k32.CloseHandle(handle)
+
+
+def _lock_holder_alive(pid, recorded_start):
+    """Is the process that wrote this lock still running?
+
+    `recorded_start` is the holder's creation time as stored in the lock; when it
+    disagrees with the live process, the PID was recycled and the holder is gone.
+    """
+    if not _pid_alive(pid):
+        return False
+    if recorded_start is None:
+        # Legacy/unknown lock format: cannot prove recycling, so assume it lives.
+        return True
+    actual = _proc_start_time(pid)
+    if actual is None:
+        return True  # unable to verify -> stay conservative
+    return abs(actual - recorded_start) <= 1.0
+
+
+def _port_listening(port, timeout=0.35):
+    """True when something accepts a TCP connection on 127.0.0.1:port."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _read_lock(lock):
+    """(pid, start_time_or_None) recorded in an existing lock file."""
+    try:
+        raw = lock.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    pid = None
+    start = None
+    for line in raw.splitlines():
+        line = line.strip()
+        if line.startswith("pid="):
+            try:
+                pid = int(line[4:].strip())
+            except ValueError:
+                pid = None
+        elif line.startswith("start="):
+            try:
+                start = float(line[6:].strip())
+            except ValueError:
+                start = None
+    return pid, start
+
+
+#: An empty (pid-less) lock may only be reclaimed after this many seconds: a
+#: live creator writes its identity microseconds after creating the file, so an
+#: empty lock older than this is debris from a crash inside that window.
+LOCK_EMPTY_GRACE = 15.0
+
+#: Handle of the lock file we own, held open for the process lifetime.  On
+#: Windows an open handle that does not grant FILE_SHARE_DELETE makes the kernel
+#: refuse another process's unlink/rename/replace of that file
+#: (ERROR_SHARING_VIOLATION / ERROR_ACCESS_DENIED -> PermissionError), so a
+#: racing starter physically cannot destroy or take over the winner's lock while
+#: the winner lives.  Read sharing is still granted, so _read_lock() keeps
+#: working for everybody else.
+_LOCK_HANDLE = None
+
+
+def _lock_reclaimable(lock, pid, start):
+    """True only when this lock is *provably* the corpse of a dead instance.
+
+    The dangerous direction is the opposite one: reading a lock that another
+    process created a moment ago (empty or half written, no pid yet) and wiping
+    it out from under its owner.  Without a pid the only available signal is
+    age, so a fresh pid-less lock is treated as a live claim.
+    """
+    if pid:
+        return not _lock_holder_alive(pid, start)
+    try:
+        age = time.time() - os.stat(str(lock)).st_mtime
+    except OSError:
+        return False
+    return age > LOCK_EMPTY_GRACE
+
+
+def _same_file(path, handle):
+    """True when `path` names the very file `handle` is open on.
+
+    Identity, not content: on Windows st_ino is the NTFS file index, so this
+    still tells two locks apart when their bytes happen to match.
+    """
+    try:
+        a = os.stat(str(path))
+        b = os.fstat(handle.fileno())
+    except (OSError, ValueError):
+        return False
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def _claim_stale_lock(lock):
+    """Take over a stale lock atomically.  Returns our open handle, or None.
+
+    Both obvious ways to recycle a stale lock are racy.  `unlink()` (what this
+    used to do) is read-check-act: between reading the lock and deleting it
+    another process can create its own, and the delete then destroys the
+    *winner's* lock -- measured on the old code, 2 of 15 rounds with 4
+    simultaneous starts ended with no lock at all.  Delete-then-recreate has the
+    mirror-image hole: for a moment the path does not exist, so every process
+    that reads it inside that window also concludes "free".
+
+    So the file is never removed: our lock is built under a unique name and
+    moved into place with os.replace(), which swaps the directory entry in one
+    step -- no empty window, no restore dance, no content re-read that another
+    process can invalidate.  A live holder still has its handle open, and
+    replacing a file that is open without FILE_SHARE_DELETE fails with
+    ERROR_ACCESS_DENIED (verified on this box), so the kernel itself refuses to
+    let a loser overwrite a live winner.
+    """
+    recheck_pid, recheck_start = _read_lock(lock)
+    if recheck_pid and _lock_holder_alive(recheck_pid, recheck_start):
+        return None  # the owner came back between our first read and this one
+    tmp = "%s.%d-%s.new" % (lock, os.getpid(), uuid.uuid4().hex[:8])
+    start = _proc_start_time(os.getpid())
+    try:
+        with open(tmp, "x") as fh:
+            # Identity, not just a number: PID + creation time survives PID reuse.
+            fh.write("pid=%d\nstart=%s\ntime=%s\n" % (os.getpid(), start, time.time()))
+        # The temp file has to be closed before it can be moved: Windows refuses
+        # to rename a file that is still open (verified: WinError 32).
+        os.replace(tmp, str(lock))
+    except OSError as exc:
+        # ERROR_ACCESS_DENIED here means the current holder still has the file
+        # open: a live claimant, so leave its lock alone.
+        print("serve cannot take over lock %s (%s: %s); leaving it to its owner"
+              % (lock, type(exc).__name__, exc), flush=True)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return None
+    # Re-open the file we just installed and keep *that* handle open for the rest
+    # of the process lifetime: from here on the kernel rejects any other
+    # process's unlink/rename/replace of it.
+    try:
+        handle = open(str(lock), "rb")
+    except OSError as exc:
+        print("serve cannot re-open claimed lock %s (%s: %s); backing off"
+              % (lock, type(exc).__name__, exc), flush=True)
+        return None
+    if _read_lock(lock) != (os.getpid(), start) or not _same_file(lock, handle):
+        # Another starter slipped in between the replace and this open and
+        # installed its own lock; the loser backs off rather than serving twice.
+        print("serve lock %s was taken over while claiming it; backing off" % lock, flush=True)
+        try:
+            handle.close()
+        except OSError:
+            pass
+        return None
+    return handle
+
+
+def _release_lock(lock):
+    """Drop our claim at exit.  The handle has to go first: Windows refuses to
+    delete a file that is still open."""
+    global _LOCK_HANDLE
+    handle, _LOCK_HANDLE = _LOCK_HANDLE, None
+    if handle is not None:
+        try:
+            handle.close()
+        except OSError:
+            pass
+    if lock is None:
+        return
+    try:
+        Path(lock).unlink()
+    except OSError:
+        pass
+
+
 def _acquire_lock(port):
     # sidecar-safe: lock lives in tempdir, not next to the exe
     import tempfile as _tf
+    global _LOCK_HANDLE
     lock = Path(_tf.gettempdir()) / ("llm-ocr-serve-%d.lock" % port)
     try:
         fd = open(str(lock), "x")
-        fd.write(str(time.time()))
-        fd.close()
-        return lock
     except FileExistsError:
-        return None
+        pid, start = _read_lock(lock)
+        if pid and _lock_holder_alive(pid, start):
+            # A genuine instance owns the lock: refuse to start a second one.
+            print("serve already running (lock=%s pid=%s holder_alive=True); exiting"
+                  % (lock, pid), flush=True)
+            return None
+        busy = _port_listening(port)
+        if not _lock_reclaimable(lock, pid, start):
+            # No pid (or unreadable): the owner cannot be proven gone, so this is
+            # treated as a live claim instead of touching somebody's lock.
+            print("serve lock %s is not provably stale (pid=%s port_%d_listening=%s); "
+                  "exiting" % (lock, pid, port, busy), flush=True)
+            return None
+        if busy:
+            # The lock's owner is gone but the port is squatted by a foreign
+            # program.  Do not answer that with the misleading "already running"
+            # (exit 2): take the corpse's place and let the bind fail loudly
+            # instead (exit 3 + FATAL "cannot bind").
+            print("serve stale lock (pid=%s not running) but port %d is already in "
+                  "use; reclaiming it and attempting the bind so the real error "
+                  "surfaces" % (pid, port), flush=True)
+        else:
+            # A stale lock left by TerminateProcess, which skips Python's
+            # `finally`: recycle it atomically (see _claim_stale_lock), so two
+            # processes racing on the same corpse cannot both end up serving.
+            print("serve stale lock (pid=%s not running, port %d free); reclaiming %s"
+                  % (pid, port, lock), flush=True)
+        handle = _claim_stale_lock(lock)
+        if handle is None:
+            print("serve lost the lock race for %s; exiting" % lock, flush=True)
+            return None
+        _LOCK_HANDLE = handle   # keep it open: see the comment on _LOCK_HANDLE
+        return lock
+    else:
+        # Identity, not just a number: PID + creation time survives PID reuse.
+        fd.write("pid=%d\nstart=%s\ntime=%s\n"
+                 % (os.getpid(), _proc_start_time(os.getpid()), time.time()))
+        fd.flush()   # others must be able to read it while we keep it open
+        _LOCK_HANDLE = fd   # keep it open: see the comment on _LOCK_HANDLE
+        return lock
 
 
 def main(argv=None):
+    _force_utf8_stdio()
     ap = argparse.ArgumentParser(description="llm-ocr engine bridge")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args(argv)
@@ -532,15 +886,19 @@ def main(argv=None):
         print("serve already running (lock exists); exiting", flush=True)
         return 2
     try:
-        srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+        try:
+            srv = ExclusiveHTTPServer(("127.0.0.1", args.port), Handler)
+        except OSError as exc:
+            # Loud, non-zero exit: the Tauri shell captures this and shows it to
+            # the user instead of letting the UI time out with no explanation.
+            log("FATAL cannot bind 127.0.0.1:%d (%s: %s) — another program is "
+                "already using this port" % (args.port, type(exc).__name__, exc))
+            return 3
         srv.daemon_threads = True
         log("listening on 127.0.0.1:%d version=%s" % (args.port, SERVE_VERSION))
         srv.serve_forever()
     finally:
-        try:
-            lock.unlink()
-        except OSError:
-            pass
+        _release_lock(lock)
     return 0
 
 

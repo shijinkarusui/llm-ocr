@@ -4,7 +4,7 @@ Started 2026/9/4 17:21:03. MAX_ROUNDS=5. Reviewer: DSH subagent (read-only).
 ## Round 1 — Infrastructure note (2026-09-04)
 
 - 外部独立 reviewer 通道不可用：DSH `subagent` 探针失败（无 closing message）；`workflow` `agent()` 返回 null。按 codex-review 技能规则不静默重试，转为主代理对抗审阅（非独立 VERDICT，不作收敛判定）。
-- 计划事实断言已只读独立核实：源 PDF 存在（F:/DSH工作区/book-to-quiz-pipeline/data/语音学教程.pdf）；303 页；抽样页 0/1/99 词框数 30/16/64、每页 1 张整页图、garble_ratio 0.0556/0.0667/0.0、页矩形约 426x646pt。Route A“内嵌层几何可用”前提成立，但内嵌层确有 OCR 误差（如 p1 取样词 “:W?32e”），影响 S3 对齐假设。
+- 计划事实断言已只读独立核实：源 PDF 存在（本地扫描件 语音学教程.pdf）；303 页；抽样页 0/1/99 词框数 30/16/64、每页 1 张整页图、garble_ratio 0.0556/0.0667/0.0、页矩形约 426x646pt。Route A“内嵌层几何可用”前提成立，但内嵌层确有 OCR 误差（如 p1 取样词 “:W?32e”），影响 S3 对齐假设。
 
 ## Round 1 — Main-agent adversarial review (substitute for unavailable reviewer)
 
