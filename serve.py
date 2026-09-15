@@ -133,36 +133,178 @@ def _request_prompt(data):
     return prompt if prompt.strip() else None
 
 
-def _progress_from_usage(outdir):
-    """Read usage.jsonl: success pages / tokens / durations summary."""
-    from collections import Counter
-    usage = Path(outdir) / "usage.jsonl"
+def _code_for_status(st):
+    """Preserve upstream HTTP status when it is a real 4xx/5xx, else 502."""
+    try:
+        s = int(st)
+    except (TypeError, ValueError):
+        return 502
+    if 400 <= s <= 599:
+        return s
+    return 502
+
+
+def _progress_from_usage(outdir, planned=None, started_at=None, concurrency=None):
+    """P0: progress schema. Dedup by latest row per page (pno_0based else page_number-1);
+    skipped excludes transient==True; p50/p95 reuse batch_plan._pctl over success
+    duration_ms; pct/planned/eta/pages_per_min/elapsed/n429 added. Concurrency is a
+    live hint: caller passes on_progress snapshots (current/init) when available."""
+    try:
+        from batch_plan import _pctl as _bp_pctl
+    except ImportError:
+        from src.batch_plan import _pctl as _bp_pctl  # type: ignore
+    usage = Path(outdir) / "usage.jsonl" if str(outdir or "") else Path("") / "usage.jsonl"
     rows = []
-    if usage.is_file():
+    if str(outdir or "") and usage.is_file():
         for line in usage.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
-                rows.append(json.loads(line))
+                obj = json.loads(line)
             except ValueError:
-                pass
-    c = Counter(r.get("status") for r in rows)
-    ok = [r for r in rows if r.get("status") == "success"]
-    pages = {r.get("pno_0based") for r in ok}
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+    latest = {}
+    for idx, r in enumerate(rows):
+        if r.get("pno_0based") is not None:
+            key = r.get("pno_0based")
+        elif r.get("page_number") is not None:
+            try:
+                key = int(r.get("page_number")) - 1
+            except (TypeError, ValueError):
+                key = r.get("page_number")
+        else:
+            key = idx
+        latest[key] = r
+    pages = list(latest.values())
+    ok = [r for r in pages if r.get("status") == "success"]
+    skipped = sum(1 for r in pages if r.get("status") == "skipped" and not r.get("transient"))
+    failed = sum(1 for r in pages if r.get("status") == "failed")
     toks = sum(int(r.get("total_tokens") or 0) for r in ok)
     durs = sorted(int(r.get("duration_ms") or 0) for r in ok if r.get("duration_ms"))
-    p50 = durs[len(durs) // 2] if durs else 0
-    p95 = durs[int(len(durs) * 0.95)] if durs else 0
-    return {"records": len(rows), "pages_ok": len(pages), "tokens": toks,
-            "skipped": c.get("skipped", 0), "failed": c.get("failed", 0),
-            "p50_ms": p50, "p95_ms": p95}
+    n429 = 0
+    for r in rows:
+        try:
+            if int(r.get("rate_429") or 0):
+                n429 += int(r.get("rate_429") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            if r.get("status") == "failed" and int(r.get("http_status") or 0) == 429:
+                n429 += 1
+        except (TypeError, ValueError):
+            pass
+    out = {"records": len(rows), "pages_ok": len(ok), "tokens": toks,
+           "skipped": skipped, "failed": failed,
+           "p50_ms": _bp_pctl(durs, 50), "p95_ms": _bp_pctl(durs, 95),
+           "n429": int(n429)}
+    if planned is not None:
+        try:
+            planned_n = int(planned)
+        except (TypeError, ValueError):
+            planned_n = 0
+        out["planned"] = planned_n
+        out["pct"] = round(len(ok) / planned_n * 100, 1) if planned_n > 0 else 0
+    else:
+        out["planned"] = 0
+        out["pct"] = 0
+    if started_at is not None:
+        try:
+            elapsed_ms = int((time.time() - float(started_at)) * 1000)
+        except (TypeError, ValueError):
+            elapsed_ms = 0
+        out["elapsed_ms"] = max(0, elapsed_ms)
+        elapsed_min = max(0, elapsed_ms) / 60000.0
+        ppm = (len(ok) / elapsed_min) if elapsed_min > 0 and len(ok) > 0 else 0.0
+        out["pages_per_min"] = round(ppm, 2)
+        remaining = max(0, (out.get("planned") or 0) - len(ok))
+        out["eta_ms"] = int(remaining / ppm * 60000) if ppm > 0 and remaining > 0 else 0
+    else:
+        out["elapsed_ms"] = 0
+        out["pages_per_min"] = 0.0
+        out["eta_ms"] = 0
+    if isinstance(concurrency, dict):
+        try:
+            out["concurrency_current"] = int(concurrency.get("current", 0))
+            out["concurrency_init"] = int(concurrency.get("init", 0))
+        except (TypeError, ValueError):
+            pass
+    return out
+
+def _usage_latest_rows(outdir):
+    """Latest usage.jsonl row per page (same dedup rule as _progress_from_usage)."""
+    usage = Path(outdir) / "usage.jsonl" if str(outdir or "") else Path("") / "usage.jsonl"
+    rows = []
+    if str(outdir or "") and usage.is_file():
+        for line in usage.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+    latest = {}
+    for idx, r in enumerate(rows):
+        if r.get("pno_0based") is not None:
+            latest[r.get("pno_0based")] = r
+        elif r.get("page_number") is not None:
+            try:
+                latest[int(r.get("page_number")) - 1] = r
+            except (TypeError, ValueError):
+                latest[r.get("page_number")] = r
+        else:
+            latest[idx] = r
+    return list(latest.values())
+
+_CONCURRENCY_HINT: dict = {}
+
+def _on_batch_progress(jid, snap):
+    """run_batch on_progress callback: remember the live limiter snapshot for polling."""
+    if isinstance(snap, dict):
+        try:
+            _CONCURRENCY_HINT[jid] = {"current": int(snap.get("current", 0)), "init": int(snap.get("init", 0))}
+        except (TypeError, ValueError):
+            pass
+
+def _job_failed_pages(job, status="failed"):
+    """Pages for GET /api/jobs/<id>/pages?status=failed (default: latest failed rows)."""
+    book_dir = (job or {}).get("book_dir") or (job or {}).get("outdir") or ""
+    pages = _usage_latest_rows(book_dir)
+    want = (status or "failed").strip().lower()
+    if want in ("all", "*"):
+        rows = pages
+    else:
+        rows = [r for r in pages if str(r.get("status") or "").lower() == want]
+    out = []
+    for r in rows:
+        try:
+            pno = int(r.get("pno_0based")) if r.get("pno_0based") is not None else int(r.get("page_number")) - 1
+        except (TypeError, ValueError):
+            continue
+        try:
+            page_number = int(r.get("page_number")) if r.get("page_number") is not None else pno + 1
+        except (TypeError, ValueError):
+            page_number = pno + 1
+        out.append({"pno_0based": pno, "page_number": page_number,
+                    "status": str(r.get("status") or ""),
+                    "error": str(r.get("error") or "")[:300],
+                    "http_status": r.get("http_status"),
+                    "attempt": r.get("attempt"),
+                    "duration_ms": r.get("duration_ms")})
+    out.sort(key=lambda x: x["pno_0based"])
+    return out
+
 
 def _new_job(kind, label):
     jid = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
         JOBS[jid] = {"id": jid, "kind": kind, "label": label, "status": "queued",
-                     "created": time.time(), "cancel": False}
+                     "created": time.time(), "started_at": time.time(), "cancel": False}
     return jid
 
 
@@ -184,13 +326,18 @@ def _job_cancelled(jid):
 
 def _run_batch_job(jid, pdf_path, outdir, kw, cleanup=None):
     from batch_plan import book_output_dir, run_batch
-    _job_set(jid, status="running")
+    _job_set(jid, status="running", started_at=time.time())
     try:
-        summary = run_batch(pdf_path, outdir, **kw)
+        # P0 true cancel: cooperative stop wired into run_batch; in-flight pages
+        # finish, queued futures are dropped (cancel_futures=True).
+        summary = run_batch(pdf_path, outdir, should_stop=lambda: _job_cancelled(jid),
+                            on_progress=lambda snap: _on_batch_progress(jid, snap), **kw)
         # usage.jsonl lives in the per-book folder, not directly under outdir.
-        prog = _progress_from_usage(book_output_dir(pdf_path, outdir))
+        _job = _job_get(jid)
+        prog = _progress_from_usage(book_output_dir(pdf_path, outdir), planned=_job.get("planned"),
+                                    started_at=_job.get("started_at"),
+                                    concurrency=_CONCURRENCY_HINT.get(jid))
         if _job_cancelled(jid):
-            # best-effort cooperative cancel: 当前页跑完才停, engine 层 cooperative cancel 待后续.
             _job_set(jid, status="cancelled", summary=summary, progress=prog)
             log("batch job %s cancelled" % jid)
             return
@@ -211,7 +358,7 @@ def _run_batch_job(jid, pdf_path, outdir, kw, cleanup=None):
 def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords, book_dir=None):
     import fitz
     from make_searchable import make_searchable
-    from verify_searchable import verify
+    from verify_searchable import verify, verify_alignment
     _job_set(jid, status="running")
     try:
         root = Path(out_dir)
@@ -222,18 +369,47 @@ def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords,
         md = {int(p.stem.split("_")[1]): p.read_text(encoding="utf-8") for p in pages}
         with fitz.open(str(pdf_path)) as doc:
             total = doc.page_count
-        missing = [p for p in range(total) if p not in md and str(p) not in md]
+        # P0 structured missing pages: machine-readable list + resume hint.
+        missing = sorted(p for p in range(total) if p not in md and str(p) not in md)
         if missing:
-            raise ValueError("missing Markdown for %d page(s), e.g. %s; resume batch first" % (len(missing), missing[:5]))
+            _job_set(jid, status="error", error="missing Markdown for %d page(s); resume batch first" % len(missing),
+                     error_code="MISSING_PAGES", hint_cn="缺 %d 页，先回批量把缺的页补跑出来" % len(missing),
+                     next_action="resume batch then rebuild",
+                     missing_pages=missing[:200], missing_count=len(missing),
+                     missing_example=missing[:5])
+            log("searchable job %s missing %d pages e.g. %s" % (jid, len(missing), missing[:5]))
+            return
         target = root / "book_searchable.pdf"
         align_out = root / "align"
         make_searchable(pdf_path, list(range(total)), md, None, target,
                         geo_source=geo_source, align_out=align_out)
         res = verify(target, keywords) if keywords else {}
+        # P0 alignment verification: run against the exact align artifacts this
+        # build just wrote (boxes.json + align_report.json), not keyword search.
+        align_report = None
+        try:
+            align_report = verify_alignment(
+                target, md, align_out / "boxes.json", align_out / "align_report.json",
+                report_path=align_out / "verify_report.json")
+        except Exception as exc:  # noqa: BLE001 - verify must not sink a good build
+            align_report = {"verify_error": "%s: %s" % (type(exc).__name__, exc)}
+        fonts = {"ipa": bool(Path(r"C:\Windows\Fonts\segoeui.ttf").is_file()),
+                 "symbol": bool(Path(r"C:\Windows\Fonts\seguisym.ttf").is_file())}
+        font_warnings = []
+        if not fonts["ipa"]:
+            font_warnings.append("IPA 字体缺失 (segoeui.ttf)：音标字形可能回退显示")
+        if not fonts["symbol"]:
+            font_warnings.append("符号字体缺失 (seguisym.ttf)：特殊符号可能回退显示")
         out = {"pdf": str(target), "bytes": target.stat().st_size, "pages": total,
                "copyable_chars": (res or {}).get("copyable_chars", "?"),
                "hit_pages": (res or {}).get("hit_pages", []),
-               "hit_page_count": len((res or {}).get("hit_pages", []))}
+               "hit_page_count": len((res or {}).get("hit_pages", [])),
+               "align_dir": str(align_out),
+               "align_summary": ((align_report or {}).get("summary") if isinstance(align_report, dict) else None),
+               "verify_report": str(align_out / "verify_report.json"),
+               "fonts": fonts, "font_warnings": font_warnings}
+        if isinstance(align_report, dict) and align_report.get("verify_error"):
+            out["verify_error"] = align_report["verify_error"]
         if book_dir:
             # Keep the book folder self-describing: record the artifact we just made.
             # For a legacy dir (no book.json yet) this also writes the missing
@@ -246,7 +422,6 @@ def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords,
             except Exception as exc:  # noqa: BLE001
                 out["book_json_error"] = "%s: %s" % (type(exc).__name__, exc)
         if _job_cancelled(jid):
-            # best-effort cooperative cancel: 当前页跑完才停, engine 层 cooperative cancel 待后续.
             _job_set(jid, status="cancelled", result=out)
             log("searchable job %s cancelled" % jid)
             return
@@ -291,6 +466,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_error(self, http_code, error_code, error, hint_cn="", next_action="", http_status=None, elapsed_ms=None, extra=None):
+        """P0 unified error envelope: keep legacy `error`, add error_code/hint_cn/next_action."""
+        obj = {"error": error, "error_code": error_code, "hint_cn": hint_cn, "next_action": next_action}
+        if http_status is not None:
+            obj["http_status"] = http_status
+        if elapsed_ms is not None:
+            obj["elapsed_ms"] = elapsed_ms
+        if isinstance(extra, dict):
+            for k, v in extra.items():
+                if k not in obj:
+                    obj[k] = v
+        self._send(http_code, obj)
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors()
@@ -308,7 +495,16 @@ class Handler(BaseHTTPRequestHandler):
                 base_url = (qs.get("base_url") or [""])[0]
                 key = self.headers.get("X-LLM-Key") or ""
                 log("models base=%s key=%s" % (base_url, masked_key(key)))
-                models = list_models(base_url=base_url or None, api_key=key or None)
+                try:
+                    models = list_models(base_url=base_url or None, api_key=key or None)
+                except Exception as exc:  # noqa: BLE001 - GET envelope must carry gateway code
+                    _mst = getattr(exc, "status", None)
+                    _mec = getattr(exc, "error_code", None) or "UNKNOWN"
+                    _mhe = getattr(exc, "hint_cn", "") or "拉取模型列表失败"
+                    _mne = getattr(exc, "next_action", "") or "check base_url and key"
+                    self._send_error(_code_for_status(_mst) if _mst is not None else 502, _mec,
+                                     "%s: %s" % (type(exc).__name__, exc), _mhe, _mne, http_status=_mst)
+                    return
                 ids = [m.get("id") if isinstance(m, dict) else str(m) for m in models]
                 self._send(200, {"models": ids, "count": len(ids)})
             elif path == "/api/prompt":
@@ -325,25 +521,55 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"base_url": base_url, "model": model,
                                  "key": masked_key(key), "endpoint": endpoint,
                                  "detail": detail})
-            elif path.startswith("/api/jobs/"):
+            elif path.startswith("/api/jobs/") and not path.endswith("/cancel"):
                 jid = path[len("/api/jobs/"):]
+                if "/" in jid:
+                    # e.g. /api/jobs/<id>/pages?status=failed&limit=200&offset=0
+                    head, _, tail = jid.partition("/")
+                    tail_path = tail.split("?", 1)[0]
+                    if tail_path == "pages":
+                        job = _job_get(head)
+                        if not job:
+                            self._send_error(404, "UNKNOWN", "unknown job", "未找到该任务", "check job_id")
+                            return
+                        want = (qs.get("status") or ["failed"])[0]
+                        try:
+                            limit = max(1, min(2000, int((qs.get("limit") or ["200"])[0])))
+                        except (TypeError, ValueError):
+                            limit = 200
+                        try:
+                            offset = max(0, int((qs.get("offset") or ["0"])[0]))
+                        except (TypeError, ValueError):
+                            offset = 0
+                        pages = _job_failed_pages(job, status=want)
+                        self._send(200, {"pages": pages[offset:offset + limit], "total": len(pages)})
+                        return
+                    self._send_error(404, "UNKNOWN", "not found", "未知子路径", "check URL: /api/jobs/<id>/pages")
+                    return
                 job = _job_get(jid)
                 if not job:
-                    self._send(404, {"error": "unknown job"})
+                    self._send_error(404, "UNKNOWN", "unknown job", "未找到该任务", "check job_id")
                     return
                 out = {k: v for k, v in job.items() if k != "cancel"}
                 if job.get("kind") == "batch" and job.get("status") == "running":
                     try:
                         out["progress"] = _progress_from_usage(
-                            job.get("book_dir") or job.get("outdir") or "")
+                            job.get("book_dir") or job.get("outdir") or "",
+                            planned=job.get("planned"), started_at=job.get("started_at"),
+                            concurrency=_CONCURRENCY_HINT.get(jid))
                     except Exception:
                         pass
                 self._send(200, out)
             else:
-                self._send(404, {"error": "not found"})
+                self._send_error(404, "UNKNOWN", "not found: %s" % path, "未知接口", "check URL")
         except Exception as exc:  # noqa: BLE001
             log("GET %s failed %s" % (path, exc))
-            self._send(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            _gec = getattr(exc, "error_code", None) or "UNKNOWN"
+            _geh = getattr(exc, "hint_cn", "") or "服务端内部错误"
+            _gen = getattr(exc, "next_action", "") or "retry later"
+            _gst = getattr(exc, "status", None)
+            _gcode = _code_for_status(_gst) if _gst is not None else 500
+            self._send_error(_gcode, _gec, "%s: %s" % (type(exc).__name__, exc), _geh, _gen, http_status=_gst)
 
     def do_POST(self):
         url = urlparse(self.path)
@@ -351,7 +577,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = _body(self)
             if "_raw_error" in data:
-                self._send(400, {"error": data["_raw_error"]})
+                self._send_error(400, "BAD_EXTRA_JSON", data["_raw_error"], "请求体不是合法JSON对象", "send a JSON object body")
                 return
             if path == "/api/probe":
                 self._handle_probe(data)
@@ -378,94 +604,147 @@ class Handler(BaseHTTPRequestHandler):
                 with JOBS_LOCK:
                     if jid in JOBS:
                         JOBS[jid]["cancel"] = True
+                        JOBS[jid]["cancel_requested_at"] = time.time()
                         self._send(200, {"ok": True})
                     else:
-                        self._send(404, {"error": "unknown job"})
+                        self._send_error(404, "UNKNOWN", "unknown job", "未找到该任务", "check job_id")
             else:
-                self._send(404, {"error": "not found"})
+                self._send_error(404, "UNKNOWN", "not found: %s" % path, "未知接口", "check URL")
+        except ValueError as exc:
+            log("POST %s bad request %s" % (path, exc))
+            _pec = getattr(exc, "error_code", None) or "BAD_EXTRA_JSON"
+            _phe = getattr(exc, "hint_cn", "") or "请求参数错误"
+            _pne = getattr(exc, "next_action", "") or "fix request params"
+            _pst = getattr(exc, "status", None)
+            _pcode = _code_for_status(_pst) if _pst is not None else 400
+            self._send_error(_pcode, _pec, "%s: %s" % (type(exc).__name__, exc), _phe, _pne, http_status=_pst)
         except Exception as exc:  # noqa: BLE001
             log("POST %s failed %s" % (path, exc))
             try:
                 traceback.print_exc()
             except (OSError, ValueError):
                 pass  # stderr gone too (orphaned process): still answer the caller
-            self._send(500, {"error": "%s: %s" % (type(exc).__name__, exc)})
-
-    # ---- handlers ----
-
+            _eec = getattr(exc, "error_code", None) or "UNKNOWN"
+            _ehe = getattr(exc, "hint_cn", "") or "服务端内部错误"
+            _ene = getattr(exc, "next_action", "") or "retry later"
+            _est = getattr(exc, "status", None)
+            _ecode = _code_for_status(_est) if _est is not None else 500
+            self._send_error(_ecode, _eec, "%s: %s" % (type(exc).__name__, exc), _ehe, _ene, http_status=_est)
     def _handle_probe(self, data):
         import time as _time
-        llm, extra = _llm_kwargs(data)
+        try:
+            llm, extra = _llm_kwargs(data)
+        except ValueError as exc:
+            self._send_error(400, "BAD_EXTRA_JSON", str(exc), "extra必须是对象", "send extra as JSON object")
+            return
         endpoint = (data.get("endpoint") or "responses").strip().lower()
         log("probe ep=%s model=%s key=%s" % (endpoint, llm["model"], masked_key(llm["api_key"])))
         png = _res_file("tests", "cand_165.png").read_bytes()
         import llm_client as C
         prompt = "Transcribe this page exactly (OCR only):"
         t0 = _time.monotonic()
-        if endpoint == "auto":
-            text, usage = C.auto_vision(png, prompt, **llm, **extra)
-        elif endpoint == "responses":
-            text, usage = C.responses_vision(png, prompt, **llm, **extra)
-        elif endpoint == "chat":
-            text, usage = C.chat_vision(png, prompt, **llm, **extra)
-        elif endpoint in ("messages", "anthropic"):
-            import warnings as _warn
-            _warn.warn("messages experimental, no guarantee", UserWarning)
-            text, usage = C.anthropic_vision(png, prompt, **llm, **extra)
-        else:
-            self._send(400, {"error": "unknown endpoint: %s" % endpoint})
+        try:
+            if endpoint == "auto":
+                text, usage = C.auto_vision(png, prompt, **llm, **extra)
+            elif endpoint == "responses":
+                text, usage = C.responses_vision(png, prompt, **llm, **extra)
+            elif endpoint == "chat":
+                text, usage = C.chat_vision(png, prompt, **llm, **extra)
+            elif endpoint in ("messages", "anthropic"):
+                import warnings as _warn
+                _warn.warn("messages experimental, no guarantee", UserWarning)
+                text, usage = C.anthropic_vision(png, prompt, **llm, **extra)
+            else:
+                self._send_error(400, "UNKNOWN", "unknown endpoint: %s" % endpoint, "不支持的endpoint", "use responses|chat|auto|messages")
+                return
+        except Exception as exc:
+            ms = int((_time.monotonic() - t0) * 1000)
+            _ec = getattr(exc, "error_code", None) or "UNKNOWN"
+            _hc = getattr(exc, "hint_cn", "") or ""
+            _nx = getattr(exc, "next_action", "") or ""
+            _st = getattr(exc, "status", None)
+            _code = _code_for_status(_st)
+            self._send_error(_code, _ec, "%s: %s" % (type(exc).__name__, exc), _hc, _nx, http_status=_st, elapsed_ms=ms)
             return
         ms = int((_time.monotonic() - t0) * 1000)
         ep_used = str((usage or {}).get("_endpoint_normalized", endpoint)) if isinstance(usage, dict) else endpoint
+        if not (text or "").strip():
+            self._send_error(422, "EMPTY_OUTPUT", "empty OCR output", "模型返回空: 调大max_output_tokens或改reasoning low", "raise max_output_tokens / set reasoning low", elapsed_ms=ms)
+            return
         self._send(200, {"endpoint_used": ep_used, "text": text,
                          "usage": usage if isinstance(usage, dict) else {},
                          "elapsed_ms": ms})
 
     def _handle_ocr_image(self, data):
+        import time as _time
         from ocr_page import ocr_image
         _ensure_prompt_module()
-        llm, extra = _llm_kwargs(data)
+        try:
+            llm, extra = _llm_kwargs(data)
+        except ValueError as exc:
+            self._send_error(400, "BAD_EXTRA_JSON", str(exc), "extra必须是对象", "send extra as JSON object")
+            return
         try:
             png = base64.b64decode(data.get("png_b64") or "", validate=True)
         except (binascii.Error, ValueError):
-            self._send(400, {"error": "png_b64 is not valid base64"})
+            self._send_error(400, "BAD_EXTRA_JSON", "png_b64 is not valid base64", "png_b64不是合法base64", "send valid base64 PNG bytes")
             return
         if not png:
-            self._send(400, {"error": "png_b64 required"})
+            self._send_error(400, "BAD_EXTRA_JSON", "png_b64 required", "缺少png_b64", "send png_b64")
             return
+        t0 = _time.monotonic()
         text = ocr_image(png, base_url=llm["base_url"], model=llm["model"],
                          api_key=llm["api_key"], endpoint=data.get("endpoint") or "responses",
                          detail=llm["detail"], extra=extra, timeout=data.get("timeout"),
                          prompt=_request_prompt(data))
-        self._send(200, {"markdown": text})
+        ms = int((_time.monotonic() - t0) * 1000)
+        if not (text or "").strip():
+            self._send_error(422, "EMPTY_OUTPUT", "empty OCR output", "模型返回空: 调大max_output_tokens或改reasoning low", "raise max_output_tokens / set reasoning low", elapsed_ms=ms)
+            return
+        self._send(200, {"markdown": text, "elapsed_ms": ms, "dpi_actual": 0, "page_count": 1})
 
     def _handle_ocr_url(self, data):
+        import time as _time
         from ocr_page import ocr_image_url
         _ensure_prompt_module()
-        llm, extra = _llm_kwargs(data)
+        try:
+            llm, extra = _llm_kwargs(data)
+        except ValueError as exc:
+            self._send_error(400, "BAD_EXTRA_JSON", str(exc), "extra必须是对象", "send extra as JSON object")
+            return
         url = (data.get("image_url") or "").strip()
         if not url:
-            self._send(400, {"error": "image_url required"})
+            self._send_error(400, "BAD_EXTRA_JSON", "image_url required", "缺少image_url", "send image_url")
             return
+        t0 = _time.monotonic()
         text = ocr_image_url(url, base_url=llm["base_url"], model=llm["model"],
                              api_key=llm["api_key"], endpoint=data.get("endpoint") or "responses",
                              detail=llm["detail"], extra=extra, timeout=data.get("timeout"),
                              prompt=_request_prompt(data))
-        self._send(200, {"markdown": text})
+        ms = int((_time.monotonic() - t0) * 1000)
+        if not (text or "").strip():
+            self._send_error(422, "EMPTY_OUTPUT", "empty OCR output", "模型返回空: 调大max_output_tokens或改reasoning low", "raise max_output_tokens / set reasoning low", elapsed_ms=ms)
+            return
+        self._send(200, {"markdown": text, "elapsed_ms": ms, "dpi_actual": 0, "page_count": 1})
 
     def _handle_ocr_pdf_page(self, data):
+        import time as _time
         from ocr_page import ocr_pdf_page
         _ensure_prompt_module()
         from render import render_page
-        llm, extra = _llm_kwargs(data)
+        try:
+            llm, extra = _llm_kwargs(data)
+        except ValueError as exc:
+            self._send_error(400, "BAD_EXTRA_JSON", str(exc), "extra必须是对象", "send extra as JSON object")
+            return
         pdf = (data.get("pdf_path") or "").strip()
         if not pdf or not Path(pdf).is_file():
-            self._send(400, {"error": "pdf_path must be an existing file"})
+            self._send_error(400, "BAD_EXTRA_JSON", "pdf_path must be an existing file", "PDF路径不存在", "check pdf_path (server-side path)")
             return
         try:
             pno = int(data.get("pno", 0))
         except (TypeError, ValueError):
-            self._send(400, {"error": "pno must be an integer"})
+            self._send_error(400, "BAD_EXTRA_JSON", "pno must be an integer", "页码必须是整数", "send integer pno (0-based)")
             return
         try:
             dpi = int(data.get("dpi") or 200)
@@ -476,11 +755,12 @@ class Handler(BaseHTTPRequestHandler):
             with _fitz.open(str(pdf)) as _doc:
                 _page_count = _doc.page_count
         except Exception as exc:
-            self._send(400, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            self._send_error(400, "BAD_EXTRA_JSON", "%s: %s" % (type(exc).__name__, exc), "PDF打不开", "check pdf file")
             return
         if pno < 0 or pno >= _page_count:
-            self._send(400, {"error": "pno out of range 0..%d" % (_page_count - 1)})
+            self._send_error(400, "BAD_EXTRA_JSON", "pno out of range 0..%d" % (_page_count - 1), "页码越界", "use pno in 0..%d" % (_page_count - 1))
             return
+        t0 = _time.monotonic()
         try:
             preview = base64.b64encode(render_page(pdf, pno, 150)).decode("ascii")
             text = ocr_pdf_page(pdf, pno, base_url=llm["base_url"], model=llm["model"],
@@ -488,16 +768,20 @@ class Handler(BaseHTTPRequestHandler):
                                 detail=llm["detail"], extra=extra, dpi=dpi, timeout=data.get("timeout"),
                                 prompt=_request_prompt(data))
         except (IndexError, ValueError) as exc:
-            self._send(400, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            self._send_error(400, "BAD_EXTRA_JSON", "%s: %s" % (type(exc).__name__, exc), "请求参数错误", "fix request params")
             return
-        self._send(200, {"markdown": text, "png_b64_preview": preview})
+        ms = int((_time.monotonic() - t0) * 1000)
+        if not (text or "").strip():
+            self._send_error(422, "EMPTY_OUTPUT", "empty OCR output", "模型返回空: 调大max_output_tokens或改reasoning low", "raise max_output_tokens / set reasoning low", elapsed_ms=ms)
+            return
+        self._send(200, {"markdown": text, "png_b64_preview": preview, "elapsed_ms": ms, "dpi_actual": dpi, "page_count": _page_count})
 
     def _handle_dry_run(self, data):
         import fitz
         from batch_plan import book_output_dir, page_plan
         pdf = (data.get("pdf_path") or "").strip()
         if not pdf or not Path(pdf).is_file():
-            self._send(400, {"error": "pdf_path must be an existing file"})
+            self._send_error(400, "BAD_EXTRA_JSON", "pdf_path must be an existing file", "PDF路径不存在（服务端本地路径）", "check pdf_path (server-side path)")
             return
         outdir = (data.get("outdir") or "out/book_gui").strip() or "out/book_gui"
         start = int(data.get("start") or 0)
@@ -507,15 +791,22 @@ class Handler(BaseHTTPRequestHandler):
         with fitz.open(str(pdf)) as doc:
             total = doc.page_count
         first5 = [{"pno_0based": i["pno_0based"], "page_number": i["page_number"]} for i in plan[:5]]
+        # P0 resume visibility: done pages already on disk under the per-book root.
+        book_dir = book_output_dir(Path(pdf), Path(outdir))
+        done_rows = [r for r in _usage_latest_rows(str(book_dir)) if r.get("status") == "success"]
+        done_pages = len(done_rows)
+        book_json = str(book_dir / "book.json") if (book_dir / "book.json").is_file() else None
         # Per-book root the run will actually write to (pages/, usage.jsonl, book md).
         self._send(200, {"total_pages": total, "planned_pages": len(plan), "first5": first5,
-                         "book_dir": str(book_output_dir(Path(pdf), Path(outdir)))})
+                         "book_dir": str(book_dir), "done_pages": done_pages,
+                         "remaining": max(0, len(plan) - done_pages), "book_json": book_json})
 
     def _handle_batch_run(self, data):
-        from batch_plan import book_output_dir
+        import fitz as _batch_fitz
+        from batch_plan import book_output_dir, page_plan
         pdf = (data.get("pdf_path") or "").strip()
         if not pdf or not Path(pdf).is_file():
-            self._send(400, {"error": "pdf_path must be an existing file"})
+            self._send_error(400, "BAD_EXTRA_JSON", "pdf_path must be an existing file", "PDF路径不存在（服务端本地路径）", "check pdf_path (server-side path)")
             return
         llm, extra = _llm_kwargs(data)
         outdir = (data.get("outdir") or "out/book_gui").strip() or "out/book_gui"
@@ -542,7 +833,13 @@ class Handler(BaseHTTPRequestHandler):
                   api_key=llm["api_key"], endpoint=data.get("endpoint") or "responses",
                   detail=llm["detail"], extra=extra, timeout=data.get("timeout"))
         jid = _new_job("batch", "batch %s" % Path(pdf).name)
-        _job_set(jid, outdir=outdir, book_dir=str(book_output_dir(Path(pdf), Path(outdir))))
+        _job_set(jid, outdir=outdir, book_dir=str(book_output_dir(Path(pdf), Path(outdir))),
+                 planned=len(page_plan(Path(pdf), Path(outdir), start, end)))
+        try:
+            with _batch_fitz.open(str(pdf)) as _doc:
+                _job_set(jid, total_pages=_doc.page_count)
+        except Exception:
+            pass
         threading.Thread(target=_run_batch_job,
                          args=(jid, pdf, outdir, kw, cleanup), daemon=True).start()
         log("batch job %s started pdf=%s key=%s" % (jid, pdf, masked_key(llm["api_key"])))
@@ -554,10 +851,10 @@ class Handler(BaseHTTPRequestHandler):
         pdf = (data.get("pdf_path") or "").strip()
         outdir = (data.get("outdir") or "").strip()
         if not outdir or not Path(outdir).is_dir():
-            self._send(400, {"error": "outdir must contain pages/page_*.md"})
+            self._send_error(400, "BAD_EXTRA_JSON", "outdir must contain pages/page_*.md", "输出目录不存在或没有 pages（服务端本地路径）", "check outdir (server-side path)")
             return
         if pdf and not Path(pdf).is_file():
-            self._send(400, {"error": "pdf_path must be an existing file"})
+            self._send_error(400, "BAD_EXTRA_JSON", "pdf_path must be an existing file", "PDF路径不存在（服务端本地路径）", "check pdf_path (server-side path)")
             return
         # Bind the folder to a book before building anything: guessing here would
         # silently lay one book's OCR onto another book's raster.
@@ -566,20 +863,20 @@ class Handler(BaseHTTPRequestHandler):
             book_dir_hint=book_output_dir(pdf, outdir) if pdf else None,
         )
         if resolved["status"] in ("error", "not_found", "ambiguous", "mismatch"):
-            self._send(400, {"error": resolved["message"], "status": resolved["status"],
-                             "candidates": resolved.get("candidates") or []})
+            self._send_error(400, "BAD_EXTRA_JSON", resolved["message"], resolved["message"], "pick the book_dir from candidates or bind with pdf_path",
+                             extra={"status": resolved["status"], "candidates": resolved.get("candidates") or []})
             return
         pdf_use = resolved.get("source_pdf") or pdf
         if not pdf_use or not Path(pdf_use).is_file():
-            self._send(400, {"error": "无法确定源 PDF：该目录没有 book.json 记录源文件，请手动选择原 PDF"})
+            self._send_error(400, "BAD_EXTRA_JSON", "source PDF unknown: pick the original PDF", "无法确定源 PDF：该目录没有 book.json 记录源文件，请手动选择原 PDF", "pick pdf_path manually")
             return
         pages_dir = resolved.get("pages_dir") or str(Path(outdir) / "pages")
         if not Path(pages_dir).is_dir():
-            self._send(400, {"error": "目录里没有 pages/*.md：%s" % pages_dir})
+            self._send_error(400, "MISSING_PAGES", "no pages/*.md under %s" % pages_dir, "目录里没有 pages/*.md：%s" % pages_dir, "run batch first, then rebuild")
             return
         geo = (data.get("geo_source") or "auto").strip()
         if geo == "external":
-            self._send(400, {"error": "geo_source=external 需要外部 boxes（当前 API 未接 boxes 参数），请用 auto/embedded/fallback_only"})
+            self._send_error(400, "BAD_EXTRA_JSON", "geo_source=external needs external boxes (API takes no boxes param)", "geo_source=external 需要外部 boxes（当前 API 未接 boxes 参数），请用 auto/embedded/fallback_only", "use auto/embedded/fallback_only")
             return
         kws = data.get("keywords") or []
         if isinstance(kws, str):
@@ -604,7 +901,7 @@ class Handler(BaseHTTPRequestHandler):
         outdir = (data.get("dir") or data.get("outdir") or "").strip()
         pdf = (data.get("pdf_path") or "").strip()
         if not outdir:
-            self._send(400, {"error": "dir is required"})
+            self._send_error(400, "BAD_EXTRA_JSON", "dir is required", "缺少目录参数 dir（服务端本地路径）", "send dir")
             return
         resolved = resolve_book(
             outdir, pdf or None,
@@ -615,10 +912,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_file_b64(self, data):
         p = (data.get("path") or "").strip()
         if not p or not Path(p).is_file():
-            self._send(400, {"error": "path must be an existing file"})
+            self._send_error(400, "BAD_EXTRA_JSON", "path must be an existing file", "文件路径不存在（服务端本地路径）", "check path (server-side path)")
             return
         if Path(p).stat().st_size > 50 * 1024 * 1024:
-            self._send(400, {"error": "file too large (>50MB)"})
+            self._send_error(400, "BAD_EXTRA_JSON", "file too large (>50MB)", "文件超过 50MB 上限", "pick a smaller file")
             return
         b64 = base64.b64encode(Path(p).read_bytes()).decode("ascii")
         self._send(200, {"b64": b64, "bytes": len(b64)})
@@ -628,7 +925,7 @@ class Handler(BaseHTTPRequestHandler):
         from check_notation import check_file
         d = (data.get("dir") or "").strip()
         if not d or not Path(d).is_dir():
-            self._send(400, {"error": "dir must be an existing directory"})
+            self._send_error(400, "BAD_EXTRA_JSON", "dir must be an existing directory", "目录不存在（服务端本地路径）", "check dir (server-side path)")
             return
         pages = sorted(Path(d).glob("pages/page_*.md")) or sorted(Path(d).glob("page_*.md"))
         codes: Counter = Counter()

@@ -8,10 +8,19 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/EmptyState";
 import { useLog } from "@/stores/log";
 import { searchableBuild, job, jobCancel, bookResolve, type BookResolveRes } from "@/lib/engine";
+import { toZh } from "@/lib/errors";
 import { pickFile, pickDir, PDF_FILTER } from "@/lib/pick";
 
-type Geo = "auto" | "embedded" | "external" | "fallback_only";
-type Phase = "idle" | "running" | "done" | "error";
+// P4: hide `external` (backend has no boxes param and always 400s it).
+type Geo = "auto" | "embedded" | "fallback_only";
+type Phase = "idle" | "running" | "done" | "cancelled" | "error";
+
+function fmtBytes(n: unknown): string {
+  if (typeof n !== "number" || !Number.isFinite(n)) return "?";
+  if (n < 1024) return `${n} 字节`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
 
 export function SearchableView() {
   const emit = useLog((s) => s.emit);
@@ -24,7 +33,9 @@ export function SearchableView() {
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState("");
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
+  const [copied, setCopied] = useState(false);
   const timer = useRef<number | null>(null);
+  const failCount = useRef(0);
 
   function stopPoll() {
     if (timer.current !== null) {
@@ -38,19 +49,34 @@ export function SearchableView() {
   async function poll(id: string) {
     try {
       const j = await job(id);
+      failCount.current = 0;
       if (j.status === "done") {
         stopPoll();
         setResult((j.result as Record<string, unknown>) ?? {});
         setPhase("done");
+        const warns = ((j.result as Record<string, unknown> | undefined)?.font_warnings as string[] | undefined) ?? [];
+        for (const w of warns) emit(w, "warn");
         emit("构建双层 PDF 完成", "ok");
+      } else if (j.status === "cancelled") {
+        stopPoll();
+        setResult((j.result as Record<string, unknown> | undefined) ?? null);
+        setPhase("cancelled");
+        emit("构建已取消", "warn");
       } else if (j.status === "error") {
         stopPoll();
         setPhase("error");
-        setError(j.error ?? "未知错误");
+        const zh = toZh(j.error ?? "未知错误");
+        setError(j.error_code ? `${zh}（${j.error_code}）` : zh);
         emit(`构建失败：${j.error ?? "未知错误"}`, "err");
       }
     } catch (e) {
-      emit(`轮询失败：${e instanceof Error ? e.message : e}`, "warn");
+      failCount.current += 1;
+      emit(`轮询失败(${failCount.current})：${e instanceof Error ? e.message : e}`, "warn");
+      if (failCount.current >= 20) {
+        stopPoll();
+        setPhase("error");
+        setError("轮询 20 次失败，已暂停；检查服务端后点“构建并验证”重试。");
+      }
     }
   }
 
@@ -87,9 +113,11 @@ export function SearchableView() {
       emit("请选择有效 OCR 输出目录（含 pages/*.md）", "err");
       return;
     }
+    failCount.current = 0;
     setPhase("running");
     setError("");
     setResult(null);
+    setCopied(false);
     emit("开始：构建双层 PDF", "muted");
     try {
       // Never build one book's pages onto another book's raster: bind first.
@@ -114,10 +142,29 @@ export function SearchableView() {
       await poll(r.job_id);
     } catch (e) {
       setPhase("error");
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toZh(e));
       emit(`构建启动失败：${e instanceof Error ? e.message : e}`, "err");
     }
   }
+
+  async function copyPath() {
+    const p = String(result?.pdf ?? "");
+    if (!p) return;
+    try {
+      await navigator.clipboard.writeText(p);
+      setCopied(true);
+      emit("输出路径已复制", "ok");
+    } catch (e) {
+      emit(`复制失败：${e instanceof Error ? e.message : e}`, "err");
+    }
+  }
+
+  const summary = (result?.align_summary as Record<string, unknown> | undefined) ?? null;
+  const fontWarnings = (result?.font_warnings as string[] | undefined) ?? [];
+  const hitPages = (result?.hit_pages as number[] | undefined) ?? [];
+  const missingPages = (result?.missing_pages as number[] | undefined) ?? null;
+  const missingExample = (result?.missing_example as number[] | undefined) ?? [];
+  const missingCount = (result?.missing_count as number | undefined) ?? null;
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 p-4">
@@ -169,7 +216,7 @@ export function SearchableView() {
           )}
           <fieldset className="flex items-center gap-4">
             <legend className="w-24 shrink-0 text-[13px] leading-8 text-muted-foreground">几何源</legend>
-            {(["auto", "embedded", "external", "fallback_only"] as Geo[]).map((g) => (
+            {(["auto", "embedded", "fallback_only"] as Geo[]).map((g) => (
               <label key={g} className="flex items-center gap-1.5 font-mono text-xs">
                 <input
                   type="radio"
@@ -193,7 +240,7 @@ export function SearchableView() {
         </CardContent>
         <CardFooter className="justify-end">
           {phase === "running" ? (
-            <Button variant="destructive" onClick={async () => { if (jobId) await jobCancel(jobId); stopPoll(); emit("已请求取消", "warn"); }}>
+            <Button variant="destructive" onClick={async () => { if (jobId) await jobCancel(jobId); stopPoll(); setPhase("cancelled"); emit("已请求取消", "warn"); }}>
               取消任务
             </Button>
           ) : (
@@ -216,20 +263,64 @@ export function SearchableView() {
               <Skeleton className="h-4 w-full" />
             </div>
           )}
+          {phase === "cancelled" && (
+            <EmptyState icon={BookOpen} tone="idle" title="已取消" description="构建已取消；已落盘的产物保留，可重新构建。" actionLabel="重新构建" onAction={build} />
+          )}
           {phase === "error" && (
             <EmptyState icon={BookOpen} tone="error" title="构建失败" description={error} actionLabel="重试" onAction={build} />
+          )}
+          {phase === "error" && missingPages !== null && missingCount !== null && (
+            <div className="mt-2 text-[13px] leading-6" role="status">
+              <p className="tabular">缺 {missingCount} 页，例如：{missingExample.join("、")}</p>
+              <p className="text-muted-foreground">先回“批量”把缺的页补跑出来（续跑自动跳过已完成页），再回来重建。</p>
+            </div>
           )}
           {phase === "done" && result && (
             <div className="text-[13px] leading-6">
               <p className="break-all">输出：{String(result.pdf ?? "")}</p>
               <p className="tabular">
-                大小：{String(result.bytes ?? "?")} 字节 页数：{String(result.pages ?? "?")}
+                大小：{fmtBytes(result.bytes)} 页数：{String(result.pages ?? "?")}
               </p>
               <p className="tabular">
                 可复制字数：{String(result.copyable_chars ?? "?")} 命中页数：
                 {String(result.hit_page_count ?? "?")}
               </p>
               <p>关键词：{kw.trim() ? kw : "未填（已跳过关键词验证）"}</p>
+              {hitPages.length > 0 && (
+                <p className="tabular text-muted-foreground">命中页：{hitPages.slice(0, 20).join("、")}{hitPages.length > 20 ? `…（共 ${hitPages.length} 页）` : ""}</p>
+              )}
+              {summary && (
+                <div className="mt-2 rounded-md bg-muted p-2.5 text-xs leading-5" role="status">
+                  <p className="tabular">
+                    对齐：零损 {String(summary.zero_loss_pages ?? "?")}/{String(summary.pages_total ?? "?")} 页；
+                    几何门 {String(summary.geometric_ok_pages ?? "?")}/{String(summary.pages_total ?? "?")} 页
+                  </p>
+                  {Array.isArray(summary.geometric_fail_pages) && summary.geometric_fail_pages.length > 0 && (
+                    <p className="tabular text-destructive">
+                      几何失败页：{(summary.geometric_fail_pages as number[]).slice(0, 20).join("、")}
+                      {(summary.geometric_fail_pages as number[]).length > 20 ? "…" : ""}
+                    </p>
+                  )}
+                  {Array.isArray(summary.table_unreliable_pages) && summary.table_unreliable_pages.length > 0 && (
+                    <p className="tabular text-warn">
+                      表格不可靠页：{(summary.table_unreliable_pages as number[]).slice(0, 20).join("、")}
+                      {(summary.table_unreliable_pages as number[]).length > 20 ? "…" : ""}
+                    </p>
+                  )}
+                  <p className="break-all text-muted-foreground">
+                    对齐目录：{String(result.align_dir ?? "")} · 验证报告：{String(result.verify_report ?? "")}
+                  </p>
+                </div>
+              )}
+              {(result.verify_error as string | undefined) && (
+                <p role="note" className="text-xs leading-5 text-warn">对齐验证未完成：{String(result.verify_error)}（构建产物可用）</p>
+              )}
+              {fontWarnings.map((w) => (
+                <p key={w} role="note" className="text-xs leading-5 text-warn">{w}</p>
+              ))}
+              <div className="mt-2 flex gap-2">
+                <Button variant="outline" size="sm" onClick={copyPath}>{copied ? "已复制" : "复制路径"}</Button>
+              </div>
             </div>
           )}
         </CardContent>

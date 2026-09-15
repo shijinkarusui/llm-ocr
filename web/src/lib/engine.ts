@@ -28,9 +28,9 @@ async function req<T>(path: string, init?: RequestInit, apiKey?: string): Promis
   // Unexpected token '<'", which hides the real problem. Decode defensively and
   // report what actually came back.
   const text = await r.text();
-  let data: T & { error?: string };
+  let data: T & { error?: string; error_code?: string; hint_cn?: string; next_action?: string };
   try {
-    data = JSON.parse(text) as T & { error?: string };
+    data = JSON.parse(text) as T & { error?: string; error_code?: string; hint_cn?: string; next_action?: string };
   } catch {
     throw new Error(
       `响应不是 JSON: HTTP ${r.status}${r.statusText ? " " + r.statusText : ""} ${url} ` +
@@ -38,7 +38,16 @@ async function req<T>(path: string, init?: RequestInit, apiKey?: string): Promis
         `body=${JSON.stringify(text.slice(0, 200))}`,
     );
   }
-  if (!r.ok) throw new Error(data.error ?? `HTTP ${r.status}`);
+  if (!r.ok) {
+    const env = data as { error?: string; error_code?: string; hint_cn?: string; next_action?: string };
+    const msg = env.hint_cn || env.error || `HTTP ${r.status}`;
+    const err = new Error(
+      env.error_code ? JSON.stringify({ error_code: env.error_code, hint_cn: env.hint_cn, error: env.error }) + ` ${msg}` : msg,
+    );
+    (err as unknown as Record<string, unknown>).code = env.error_code;
+    (err as unknown as Record<string, unknown>).envelope = env;
+    throw err;
+  }
   return data;
 }
 
@@ -58,9 +67,10 @@ export interface ProbeRes {
   usage: Record<string, unknown>;
   elapsed_ms: number;
 }
-export function probe(p: LlmParams): Promise<ProbeRes> {
+export function probe(p: LlmParams, signal?: AbortSignal): Promise<ProbeRes> {
   return req<ProbeRes>("/api/probe", {
     method: "POST",
+    signal,
     body: JSON.stringify({
       base_url: p.baseUrl, model: p.model, key: p.key,
       endpoint: p.endpoint, detail: p.detail, timeout: p.timeout,
@@ -68,7 +78,13 @@ export function probe(p: LlmParams): Promise<ProbeRes> {
   });
 }
 
-export interface OcrRes { markdown: string; png_b64_preview?: string }
+export interface OcrRes {
+  markdown: string;
+  png_b64_preview?: string;
+  elapsed_ms?: number;
+  dpi_actual?: number;
+  page_count?: number;
+}
 
 /** Only send a prompt when the user actually customised one: an empty editor
  *  must fall back to the server's prompts/ocr_system.md, not blank it out. */
@@ -77,9 +93,10 @@ function promptField(prompt?: string): Record<string, string> {
   return v ? { prompt: v } : {};
 }
 
-export function ocrImage(p: LlmParams, pngB64: string, prompt?: string): Promise<OcrRes> {
+export function ocrImage(p: LlmParams, pngB64: string, prompt?: string, signal?: AbortSignal): Promise<OcrRes> {
   return req<OcrRes>("/api/ocr/image", {
     method: "POST",
+    signal,
     body: JSON.stringify({
       base_url: p.baseUrl, model: p.model, key: p.key,
       endpoint: p.endpoint, detail: p.detail, timeout: p.timeout, png_b64: pngB64,
@@ -88,9 +105,10 @@ export function ocrImage(p: LlmParams, pngB64: string, prompt?: string): Promise
   });
 }
 
-export function ocrUrl(p: LlmParams, imageUrl: string, prompt?: string): Promise<OcrRes> {
+export function ocrUrl(p: LlmParams, imageUrl: string, prompt?: string, signal?: AbortSignal): Promise<OcrRes> {
   return req<OcrRes>("/api/ocr/url", {
     method: "POST",
+    signal,
     body: JSON.stringify({
       base_url: p.baseUrl, model: p.model, key: p.key,
       endpoint: p.endpoint, detail: p.detail, timeout: p.timeout, image_url: imageUrl,
@@ -100,10 +118,11 @@ export function ocrUrl(p: LlmParams, imageUrl: string, prompt?: string): Promise
 }
 
 export function ocrPdfPage(
-  p: LlmParams, pdfPath: string, pno: number, dpi: number, prompt?: string,
+  p: LlmParams, pdfPath: string, pno: number, dpi: number, prompt?: string, signal?: AbortSignal,
 ): Promise<OcrRes> {
   return req<OcrRes>("/api/ocr/pdf-page", {
     method: "POST",
+    signal,
     body: JSON.stringify({
       base_url: p.baseUrl, model: p.model, key: p.key,
       endpoint: p.endpoint, detail: p.detail, timeout: p.timeout,
@@ -117,7 +136,12 @@ export interface DryRunRes {
   total_pages: number;
   planned_pages: number;
   first5: { pno_0based: number; page_number: number }[];
+  book_dir?: string;
+  done_pages?: number;
+  remaining?: number;
+  book_json?: string | null;
 }
+
 export function batchDryRun(pdfPath: string, outdir: string, start: number, end?: number): Promise<DryRunRes> {
   return req<DryRunRes>("/api/batch/dry-run", {
     method: "POST",
@@ -146,11 +170,24 @@ export function batchRun(
 export interface JobProgress {
   records: number; pages_ok: number; tokens: number;
   skipped: number; failed: number; p50_ms: number; p95_ms: number;
+  // P0 unified contract (all optional: old backend simply omits them).
+  planned?: number; pct?: number; eta_ms?: number; pages_per_min?: number;
+  elapsed_ms?: number; concurrency_current?: number; concurrency_init?: number;
+  n429?: number;
 }
 export interface JobRes {
   id: string; kind: string; label: string; status: string;
   progress?: JobProgress; summary?: Record<string, unknown>;
   result?: Record<string, unknown>; error?: string;
+  error_code?: string; hint_cn?: string; next_action?: string;
+  planned?: number; total_pages?: number; started_at?: number;
+  cancel_requested_at?: number;
+}
+export interface JobPageItem { pno_0based: number; page_number?: number; status?: string; error?: string; http_status?: number | null; attempt?: number; duration_ms?: number }
+export function jobPages(id: string, status = "failed", limit = 200, offset = 0): Promise<{ pages: JobPageItem[]; total: number }> {
+  return req<{ pages: JobPageItem[]; total: number }>(
+    `/api/jobs/${encodeURIComponent(id)}/pages?status=${encodeURIComponent(status)}&limit=${limit}&offset=${offset}`,
+  );
 }
 export function job(id: string): Promise<JobRes> {
   return req<JobRes>(`/api/jobs/${id}`);

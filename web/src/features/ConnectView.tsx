@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Plug, RefreshCw, Activity, ShieldCheck } from "lucide-react";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,7 @@ import { useSession } from "@/stores/session";
 import { useLog } from "@/stores/log";
 import { maskedKey } from "@/lib/utils";
 import { listModels, probe, type ProbeRes } from "@/lib/engine";
+import { toZh } from "@/lib/errors";
 
 type Phase = "idle" | "loading" | "done" | "error";
 
@@ -26,7 +27,11 @@ export function ConnectView() {
   const [models, setModels] = useState<string[]>([]);
   const [error, setError] = useState("");
   const [probeRes, setProbeRes] = useState<ProbeRes | null>(null);
+  const [probeError, setProbeError] = useState("");
   const [probeBusy, setProbeBusy] = useState(false);
+  const probeAbort = useRef<AbortController | null>(null);
+
+  useEffect(() => () => probeAbort.current?.abort(), []);
 
   function sync() {
     emit(`连接参数已同步 key=${maskedKey(apiKey)}`, "muted");
@@ -45,26 +50,46 @@ export function ConnectView() {
       if (data.models.length > 0 && !data.models.includes(model)) set({ model: data.models[0] });
     } catch (e) {
       setPhase("error");
-      setError(e instanceof Error ? e.message : String(e));
+      const zh = toZh(e);
+      setError(zh);
       emit(`拉取模型列表 失败：${e instanceof Error ? e.message : e}`, "err");
     }
   }
 
   async function doProbe() {
     sync();
+    probeAbort.current?.abort();
+    const ctrl = new AbortController();
+    probeAbort.current = ctrl;
+    // P3: probe is a fixed small image; a hung socket must not spin the UI forever.
+    const cap = window.setTimeout(() => ctrl.abort(), timeout * 1000 + 15000);
     setProbeBusy(true);
+    setProbeError("");
     emit("开始：单图探活 tests/cand_165.png", "muted");
     try {
-      const r = await probe({ baseUrl, model, key: apiKey, endpoint, detail, timeout });
+      const r = await probe({ baseUrl, model, key: apiKey, endpoint, detail, timeout }, ctrl.signal);
+      if (ctrl.signal.aborted) return;
       setProbeRes(r);
+      setPhase("done");
       const toks = (r.usage?.total_tokens as number | undefined) ?? "?";
       emit(`单图探活 完成（${r.endpoint_used}，tokens ${toks}）`, "ok");
     } catch (e) {
+      if (ctrl.signal.aborted) {
+        emit("单图探活 已取消", "warn");
+        return;
+      }
       setProbeRes(null);
+      setProbeError(toZh(e));
       emit(`单图探活 失败：${e instanceof Error ? e.message : e}`, "err");
     } finally {
+      window.clearTimeout(cap);
+      if (probeAbort.current === ctrl) probeAbort.current = null;
       setProbeBusy(false);
     }
+  }
+
+  function cancelProbe() {
+    probeAbort.current?.abort();
   }
 
   function doCheck() {
@@ -74,6 +99,7 @@ export function ConnectView() {
       "muted",
     );
     setProbeRes(null);
+    setProbeError("");
     setPhase("done");
   }
 
@@ -128,10 +154,16 @@ export function ConnectView() {
             <RefreshCw aria-hidden="true" className={phase === "loading" ? "animate-spin" : undefined} />
             拉取模型
           </Button>
-          <Button variant="outline" onClick={doProbe} disabled={probeBusy}>
-            <Activity aria-hidden="true" />
-            {probeBusy ? "探活中…" : "单图探活"}
-          </Button>
+          {probeBusy ? (
+            <Button variant="destructive" onClick={cancelProbe}>
+              取消探活
+            </Button>
+          ) : (
+            <Button variant="outline" onClick={doProbe}>
+              <Activity aria-hidden="true" />
+              单图探活
+            </Button>
+          )}
           <Button variant="ghost" onClick={doCheck}>
             <ShieldCheck aria-hidden="true" />
             脱敏核验
@@ -145,7 +177,7 @@ export function ConnectView() {
           <CardDescription>拉模型、探活与核验的输出都在这里。</CardDescription>
         </CardHeader>
         <CardContent>
-          {phase === "idle" && !probeRes && (
+          {phase === "idle" && !probeRes && !probeError && (
             <EmptyState
               icon={Plug}
               tone="idle" title="还没有输出"
@@ -168,6 +200,21 @@ export function ConnectView() {
               description={`原因：${error}。检查网关地址与密钥后重试。`}
               actionLabel="重试"
               onAction={fetchModels}
+            />
+          )}
+          {probeBusy && (
+            <div className="flex flex-col gap-2" aria-label="探活中">
+              <Skeleton className="h-4 w-1/2" />
+              <Skeleton className="h-4 w-full" />
+            </div>
+          )}
+          {probeError && !probeBusy && (
+            <EmptyState
+              icon={Plug}
+              tone="error" title="探活失败"
+              description={probeError}
+              actionLabel="重试"
+              onAction={doProbe}
             />
           )}
           {phase === "done" && !probeRes && models.length > 0 && (

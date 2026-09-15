@@ -393,6 +393,20 @@ class _AdaptiveLimiter:
         with self._cond:
             self.ok_streak = 0
 
+    def snapshot(self) -> dict[str, int]:
+        """P0: expose current/initial limit for progress (concurrency_current/init)."""
+        with self._cond:
+            return {"current": int(self.limit), "init": int(self.init)}
+
+
+def _limiter_snapshot(lim: _AdaptiveLimiter | None) -> dict[str, int] | None:
+    if lim is None:
+        return None
+    try:
+        return lim.snapshot()
+    except Exception:
+        return None
+
 
 def _process_one(
     item: dict[str, Any],
@@ -750,6 +764,8 @@ def run_batch(
     system: str | None = None,
     extra: dict[str, Any] | None = None,
     timeout: int | None = None,
+    should_stop: Any | None = None,
+    on_progress: Any | None = None,
 ) -> dict[str, Any]:
     if concurrency is None:
         try:
@@ -774,11 +790,18 @@ def run_batch(
     prompt = Path(prompt_path).read_text(encoding="utf-8")
     limiter = _AdaptiveLimiter(concurrency)
     results: list[dict[str, Any]] = []
+    cancelled = False
     if concurrency == 1:
-        results = [
-            _process_one(item, Path(pdf_path), prompt, dpi, usage_path, retries, base_url=base_url, model=model, api_key=api_key, endpoint=endpoint, timeout=timeout, detail=detail, system=system, extra=extra, _limiter=limiter)
-            for item in plan
-        ]
+        for item in plan:
+            if callable(should_stop) and should_stop():
+                cancelled = True
+                break
+            results.append(_process_one(item, Path(pdf_path), prompt, dpi, usage_path, retries, base_url=base_url, model=model, api_key=api_key, endpoint=endpoint, timeout=timeout, detail=detail, system=system, extra=extra, _limiter=limiter))
+            if callable(on_progress):
+                try:
+                    on_progress(_limiter_snapshot(limiter))
+                except Exception:
+                    pass
     else:
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
             futures = [
@@ -802,7 +825,31 @@ def run_batch(
                 )
                 for item in plan
             ]
-            results = [future.result() for future in as_completed(futures)]
+            # P0 true cancel: check should_stop as each page lands; stop feeding
+            # the pool and drop the rest instead of waiting for a 764-page drain.
+            pending = set(futures)
+            try:
+                for future in as_completed(list(pending)):
+                    pending.discard(future)
+                    try:
+                        results.append(future.result())
+                    except Exception as exc:
+                        results.append({"status": "failed", "error": "%s: %s" % (type(exc).__name__, exc)})
+                    if callable(on_progress):
+                        try:
+                            on_progress(_limiter_snapshot(limiter))
+                        except Exception:
+                            pass
+                    if callable(should_stop) and should_stop():
+                        cancelled = True
+                        for f in pending:
+                            f.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+            finally:
+                if cancelled:
+                    for f in pending:
+                        f.cancel()
     summary = summarize_usage(
         usage_path,
         root / "usage_summary.json",
@@ -817,6 +864,7 @@ def run_batch(
     summary["failed_pages_this_run"] = sum(
         result.get("status") == "failed" for result in results
     )
+    summary["cancelled"] = bool(cancelled)
     summary["book_dir"] = str(root)
     # Whole-book Markdown from every page file on disk (not just this run's slice),
     # so segmented resumes keep growing the same <stem>-ocr.md.

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
@@ -80,16 +80,58 @@ function SliderRow({
   );
 }
 
+/** Keys the llm_client actually honours (llm_client._coalesce_*, _post_json, ocr_page). */
+const KNOWN_EXTRA_KEYS = new Set([
+  "temperature", "top_p", "top_k", "seed", "max_tokens", "max_completion_tokens",
+  "max_output_tokens", "reasoning_effort", "reasoningEffort", "reasoning", "reasoning_budget",
+  "reasoning_budget_tokens", "thinking", "thinking_budget", "text", "tools", "tool_choice",
+  "frequency_penalty", "presence_penalty", "stop", "stop_sequences", "stream", "system",
+  "timeout", "attempts", "max_retries", "seed_optional",
+]);
+
+function warnExtra(obj: Record<string, unknown>): string[] {
+  const warns: string[] = [];
+  for (const k of Object.keys(obj)) {
+    if (!KNOWN_EXTRA_KEYS.has(k)) warns.push(`未知键 ${k}：网关可能忽略它`);
+  }
+  const len = obj.max_output_tokens ?? obj.max_tokens ?? obj.max_completion_tokens;
+  if (len !== undefined && typeof len === "number" && len < 30000) {
+    warns.push(`输出上限 ${len} 小于默认 30000：推理模型可能只剩思考、输出为空`);
+  }
+  return warns;
+}
+
 export function ParamsView() {
   const s = useSession();
   const set = useSession((x) => x.set);
   const emit = useLog((x) => x.emit);
   const [note, setNote] = useState("");
+  const [extraErr, setExtraErr] = useState("");
+  const [extraWarns, setExtraWarns] = useState<string[]>([]);
+
+  // P3 extra 即时校验：边打字边拦，错了标红并禁用“应用参数”。
+  useEffect(() => {
+    const raw = s.extraText.trim();
+    if (!raw) {
+      setExtraErr("");
+      setExtraWarns([]);
+      return;
+    }
+    try {
+      const obj = parseExtra(s.extraText);
+      setExtraErr("");
+      setExtraWarns(warnExtra(obj));
+    } catch (e) {
+      setExtraErr(e instanceof Error ? e.message : String(e));
+      setExtraWarns([]);
+    }
+  }, [s.extraText]);
 
   function apply() {
     try {
-      parseExtra(s.extraText);
-      setNote("参数已应用");
+      const obj = parseExtra(s.extraText);
+      const warns = warnExtra(obj);
+      setNote(warns.length > 0 ? `参数已应用（${warns.length} 条警告）` : "参数已应用");
     } catch (e) {
       setNote(`透传 JSON 非法：${e instanceof Error ? e.message : e}`);
     }
@@ -127,7 +169,7 @@ export function ParamsView() {
           <SliderRow id="p-retries" label="重试" hint="" value={s.retries} min={0} max={5} onChange={(v) => set({ retries: v })} />
           {s.concurrency > 8 && (
             <p role="note" className="text-xs leading-5 text-warn">
-              注意：并发大于 8 后吞吐未必再涨，注意 p95 与 429。
+              注意：并发大于 8 后吞吐未必再涨，注意 p95 与 429。批量 500 页以上启动时还会再问一次。
             </p>
           )}
           <div className="flex gap-2.5">
@@ -138,16 +180,28 @@ export function ParamsView() {
               value={s.extraText}
               onChange={(e) => set({ extraText: e.target.value })}
               aria-describedby="p-extra-note"
+              aria-invalid={extraErr ? true : undefined}
+              className={extraErr ? "border-destructive" : undefined}
             />
           </div>
-          {note && (
-            <p id="p-extra-note" role="status" className="text-xs text-muted-foreground">
+          {extraErr && (
+            <p id="p-extra-note" role="alert" className="text-xs leading-5 text-destructive">
+              透传 JSON 非法：{extraErr}
+            </p>
+          )}
+          {!extraErr && extraWarns.map((w) => (
+            <p key={w} role="note" className="text-xs leading-5 text-warn">
+              {w}
+            </p>
+          ))}
+          {note && !extraErr && (
+            <p role="status" className="text-xs text-muted-foreground">
               {note}
             </p>
           )}
         </CardContent>
         <CardFooter>
-          <Button onClick={apply}>应用参数</Button>
+          <Button onClick={apply} disabled={!!extraErr}>应用参数</Button>
         </CardFooter>
       </Card>
       <PromptCard />

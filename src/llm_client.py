@@ -78,11 +78,13 @@ RETRY_AFTER_CAP = 60
 
 
 class HttpError(RuntimeError):
-    """W0冻结契约第1条: status None=timeout/OSError/JSONDecode, 否则为HTTP状态码."""
-
-    def __init__(self, status: int | None, body: Any = None):
+    """W0+P0: status None=timeout/OSError/JSONDecode else HTTP code; carries error_code/hint_cn/next_action."""
+    def __init__(self, status: int | None, body: Any = None, error_code: str | None = None, hint_cn: str = "", next_action: str = ""):
         self.status = status
         self.body = body
+        self.error_code = error_code
+        self.hint_cn = hint_cn
+        self.next_action = next_action
         super().__init__(f"HTTP {status}: {str(body)[:400] if body is not None else ''}")
 
 # Canonical endpoint paths (relative to gateway /v1)
@@ -320,24 +322,41 @@ def _coalesce_reasoning_effort(body: dict[str, Any], *, responses_style: bool) -
         body["reasoning_effort"] = effort
 
 
-def _http_hint(status: int | None, payload: Any, base_url: str, api_path: str) -> str:
-    """W0: 4xx fail-fast映射提示(仅打印,不改变HttpError原样抛出)."""
-    text = json.dumps(payload, ensure_ascii=True)[:500] if isinstance(payload, dict) else str(payload)[:500]
+def _http_hint(status: int | None, payload: Any, base_url: str, api_path: str):
+    """P0: return (error_code, hint_cn, next_action). Print hint_cn only; raise/retry unchanged."""
+    if isinstance(payload, dict):
+        text = json.dumps(payload, ensure_ascii=True)[:500]
+    else:
+        text = str(payload)[:500]
     low = text.lower()
-    if status == 401:
-        return "hint: 401 Key无效,检查LLM_OCR_KEY"
+    if status == 401 or status == 403:
+        return ("UNAUTHORIZED", "Key invalid/no permission, check LLM_OCR_KEY", "check LLM_OCR_KEY / rotate key")
     if status == 404 and "files" in api_path:
-        return "hint: /v1/files已知未实现(404),无需使用"
+        return ("UNKNOWN", "/v1/files not implemented (404), do not use", "do not use /v1/files")
     if status == 400 and "model not found" in low:
         parsed = urllib.parse.urlparse(base_url if "://" in base_url else "http://" + base_url.lstrip("/"))
         host = (parsed.hostname or "").lower()
         octo = os.environ.get("OCTOPUS_MODEL", "").strip() or os.environ.get("OCTOPUS_API_KEY", "").strip() or os.environ.get("OCTOPUS_KEY", "").strip()
         if host != "api.openai.com" or octo:
-            return "hint: 400 model not found, Octopus场景补OC/前缀 + 建议 python -m src.cli models"
-        return ""
+            return ("MODEL_NOT_FOUND", "model not found: add OC/ prefix for Octopus gateway", "add OC/ prefix or run: python -m src.cli models")
+        return ("MODEL_NOT_FOUND", "model not found: check model id spelling", "check model id spelling")
     if status == 400 and "input[0]" in text:
-        return "hint: responses input必须包message [{role:user,content:[input_text,input_image]}]"
-    return ""
+        return ("UNKNOWN", "bad request shape: responses input must wrap message", "wrap responses input as messages")
+    if status == 429:
+        return ("RATE_LIMITED", "rate limited (429): lower concurrency and retry", "lower --concurrency and resume")
+    if isinstance(status, int) and 500 <= status <= 599:
+        return ("GATEWAY_5XX", "gateway/upstream 5xx: retry later", "retry later / check gateway status")
+    if status is None:
+        raw = ""
+        if isinstance(payload, dict):
+            raw = str(payload.get("raw", ""))[:500]
+        elif payload is not None:
+            raw = str(payload)[:500]
+        s = raw.lstrip().lower()
+        if s.startswith("<") and ("<html" in s or "<!doctype" in s):
+            return ("BAD_GATEWAY_HTML", "gateway returned HTML not JSON: check base_url/gateway", "check base_url and gateway status")
+        return ("TIMEOUT", "timeout/connection failure/non-JSON response: retry", "check network/gateway and retry")
+    return ("UNKNOWN", "unknown error (status=%s)" % (status,), "retry or report with http_status")
 
 
 def _sleep_retry(attempt: int, retry_after: str | None) -> None:
@@ -398,23 +417,25 @@ def _post_json(
             try:
                 payload = json.loads(raw.decode("utf-8"))
             except json.JSONDecodeError as exc:
-                # W0修正案(契约#1/#6): JSONDecode归None类(与timeout/OSError同类,可回退); http_status保留在body
-                raise HttpError(None, {"http_status": status, "raw": raw[:4000].decode("utf-8", errors="replace")}) from exc
-            # probe-friendly trace (ASCII-safe, no key)
+                _jb = {"http_status": status, "raw": raw[:4000].decode("utf-8", errors="replace")}
+                _jc, _jh, _jn = _http_hint(None, _jb, resolved_base, endpoint_path)
+                raise HttpError(None, _jb, error_code=_jc, hint_cn=_jh, next_action=_jn) from exc
             try:
                 usage_preview = payload.get("usage") if isinstance(payload, dict) else None
                 print(f"HTTP {status} endpoint={endpoint_path} base_url={resolved_base} usage={json.dumps(usage_preview, ensure_ascii=True) if isinstance(usage_preview, dict) else usage_preview}")
             except Exception:
                 print(f"HTTP {status} endpoint={endpoint_path} base_url={resolved_base}")
             if status == 429 or 500 <= status <= 599:
-                raise HttpError(status, payload)
+                _rc, _rh, _rn = _http_hint(status, payload, resolved_base, endpoint_path)
+                raise HttpError(status, payload, error_code=_rc, hint_cn=_rh, next_action=_rn)
             if status < 200 or status >= 300:
-                hint = _http_hint(status, payload, resolved_base, endpoint_path)
-                if hint:
-                    print(hint)
-                raise HttpError(status, payload)
+                _ec, _hc, _nx = _http_hint(status, payload, resolved_base, endpoint_path)
+                if _hc:
+                    print(_hc)
+                raise HttpError(status, payload, error_code=_ec, hint_cn=_hc, next_action=_nx)
             if not isinstance(payload, dict):
-                raise HttpError(status, payload)
+                _nc, _nh, _nn = _http_hint(status, payload, resolved_base, endpoint_path)
+                raise HttpError(status, payload, error_code=_nc, hint_cn=_nh, next_action=_nn)
             return payload
         except HttpError as exc:
             if exc.status == 429 or (exc.status is not None and 500 <= exc.status <= 599):
@@ -425,7 +446,8 @@ def _post_json(
                 continue
             raise
         except (TimeoutError, OSError) as exc:
-            last_error = HttpError(None, str(exc)[:400])
+            _tc, _th, _tn = _http_hint(None, str(exc)[:400], resolved_base, endpoint_path)
+            last_error = HttpError(None, str(exc)[:400], error_code=_tc, hint_cn=_th, next_action=_tn)
             if attempt < attempts - 1:
                 print(f"Request failed, retry {attempt + 1}/{attempts}: {exc}")
                 _sleep_retry(attempt, None)
@@ -462,16 +484,23 @@ def _get_json(
         try:
             payload = json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError as exc:
-            raise HttpError(status, {"raw": raw[:2000].decode("utf-8", errors="replace")}) from exc
+            _gb = {"http_status": status, "raw": raw[:2000].decode("utf-8", errors="replace")}
+            _gc, _gh, _gn = _http_hint(None, _gb, resolved_base, endpoint_path)
+            raise HttpError(status if isinstance(status, int) else None, _gb, error_code=_gc, hint_cn=_gh, next_action=_gn) from exc
         if status < 200 or status >= 300:
-            raise HttpError(status, payload if isinstance(payload, dict) else {"raw": str(payload)[:2000]})
+            _g2b = payload if isinstance(payload, dict) else {"raw": str(payload)[:2000]}
+            _g2c, _g2h, _g2n = _http_hint(status, _g2b, resolved_base, endpoint_path)
+            raise HttpError(status, _g2b, error_code=_g2c, hint_cn=_g2h, next_action=_g2n)
         if not isinstance(payload, dict):
-            raise HttpError(status, {"raw": str(payload)[:2000]})
+            _g3b = {"raw": str(payload)[:2000]}
+            _g3c, _g3h, _g3n = _http_hint(status, _g3b, resolved_base, endpoint_path)
+            raise HttpError(status, _g3b, error_code=_g3c, hint_cn=_g3h, next_action=_g3n)
         return payload
     except HttpError:
         raise
     except (TimeoutError, OSError) as exc:
-        raise HttpError(None, str(exc)[:400]) from exc
+        _gec, _geh, _gen = _http_hint(None, str(exc)[:400], resolved_base, endpoint_path)
+        raise HttpError(None, str(exc)[:400], error_code=_gec, hint_cn=_geh, next_action=_gen) from exc
 
 
 def generic_request(

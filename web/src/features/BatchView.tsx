@@ -9,11 +9,30 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/EmptyState";
 import { useSession } from "@/stores/session";
 import { useLog } from "@/stores/log";
-import { batchDryRun, batchRun, job, jobCancel, type DryRunRes, type JobProgress } from "@/lib/engine";
+import { batchDryRun, batchRun, job, jobCancel, jobPages, type DryRunRes, type JobPageItem, type JobProgress } from "@/lib/engine";
+import { toZh } from "@/lib/errors";
 import { pickFile, pickDir, PDF_FILTER } from "@/lib/pick";
 import { parseExtra } from "@/lib/utils";
 
-type Phase = "idle" | "loading" | "running" | "done" | "error";
+type Phase = "idle" | "loading" | "running" | "stopping" | "done" | "cancelled" | "error";
+
+function fmtEta(ms?: number): string {
+  if (!ms || ms <= 0) return "—";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `约${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `约${m}分${s % 60}s`;
+  return `约${Math.floor(m / 60)}时${m % 60}分`;
+}
+
+function fmtElapsed(ms?: number): string {
+  if (ms == null || ms < 0) return "—";
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}分${s % 60}s`;
+  return `${Math.floor(m / 60)}时${m % 60}分${s % 60}s`;
+}
 
 export function BatchView() {
   const s = useSession();
@@ -28,13 +47,22 @@ export function BatchView() {
   const [jobId, setJobId] = useState("");
   const [prog, setProg] = useState<JobProgress | null>(null);
   const [summary, setSummary] = useState<Record<string, unknown> | null>(null);
+  const [failPages, setFailPages] = useState<JobPageItem[] | null>(null);
+  const [failTotal, setFailTotal] = useState(0);
+  const [copiedFail, setCopiedFail] = useState(false);
   const timer = useRef<number | null>(null);
+  const failCount = useRef(0);
 
   function stopPoll() {
     if (timer.current !== null) {
-      window.clearInterval(timer.current);
+      window.clearTimeout(timer.current);
       timer.current = null;
     }
+  }
+
+  function schedule(id: string, delayMs: number) {
+    stopPoll();
+    timer.current = window.setTimeout(() => poll(id), delayMs);
   }
 
   useEffect(() => stopPoll, []);
@@ -52,17 +80,29 @@ export function BatchView() {
       const r = await batchDryRun(pdf.trim(), outdir.trim() || "out/book_gui", start, end);
       setDry(r);
       setPhase("idle");
-      emit(`dry-run：全书 ${r.total_pages} 页，本次计划 ${r.planned_pages} 页`, "ok");
+      const resume = (r.done_pages ?? 0) > 0 ? `（已完成 ${r.done_pages}，还剩 ${r.remaining ?? "?"}，点开始批量继续跑）` : "";
+      emit(`dry-run：全书 ${r.total_pages} 页，本次计划 ${r.planned_pages} 页${resume}`, "ok");
     } catch (e) {
       setPhase("error");
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toZh(e));
       emit(`Dry-Run 失败：${e instanceof Error ? e.message : e}`, "err");
+    }
+  }
+
+  async function loadFailPages(id: string) {
+    try {
+      const r = await jobPages(id, "failed", 200, 0);
+      setFailPages(r.pages);
+      setFailTotal(r.total);
+    } catch {
+      setFailPages(null);
     }
   }
 
   async function poll(id: string) {
     try {
       const j = await job(id);
+      failCount.current = 0;
       if (j.progress) setProg(j.progress);
       if (j.status === "done") {
         stopPoll();
@@ -71,14 +111,33 @@ export function BatchView() {
         const toks = (j.summary as Record<string, unknown> | undefined)?.total_tokens ?? "?";
         const failed = (j.summary as Record<string, unknown> | undefined)?.failed_pages_this_run ?? "?";
         emit(`batch 完成 tokens=${String(toks)} failed=${String(failed)}`, "ok");
+        await loadFailPages(id);
+      } else if (j.status === "cancelled") {
+        stopPoll();
+        setSummary((j.summary as Record<string, unknown>) ?? null);
+        setPhase("cancelled");
+        emit(`批量已取消：已落盘的不再涨，重跑自动续上`, "warn");
+        await loadFailPages(id);
       } else if (j.status === "error") {
         stopPoll();
         setPhase("error");
-        setError(j.error ?? "未知错误");
-        emit(`批量失败：${j.error ?? "未知错误"}`, "err");
+        setError(toZh(j.error ?? j.hint_cn ?? "未知错误"));
+        emit(`批量失败：${j.error ?? j.hint_cn ?? "未知错误"}`, "err");
+        await loadFailPages(id);
+      } else {
+        // running / queued: keep polling. Backoff only applies after transport failures.
+        schedule(id, 2000);
       }
     } catch (e) {
-      emit(`轮询失败：${e instanceof Error ? e.message : e}`, "warn");
+      failCount.current += 1;
+      emit(`轮询失败（${failCount.current}）：${e instanceof Error ? e.message : e}`, "warn");
+      if (failCount.current >= 20) {
+        stopPoll();
+        setPhase("error");
+        setError(`轮询多次失败已暂停（${failCount.current}次）：${toZh(e)}。任务可能仍在跑，点“继续轮询”可接着看。`);
+      } else {
+        schedule(id, failCount.current >= 5 ? 10000 : 2000);
+      }
     }
   }
 
@@ -94,10 +153,19 @@ export function BatchView() {
       emit(`extra-json 非法：${e instanceof Error ? e.message : e}`, "err");
       return;
     }
+    // 764 页级大书二次确认：计划页数来自 dry-run，未规划时按全书估。
+    const plannedGuess = dry?.planned_pages ?? 0;
+    if (plannedGuess >= 500 && !window.confirm(`本次计划 ${plannedGuess} 页，耗时较长（中途可取消、可断点续跑）。确定开始吗？`)) {
+      return;
+    }
     setPhase("running");
     setError("");
     setProg(null);
     setSummary(null);
+    setFailPages(null);
+    setFailTotal(0);
+    setCopiedFail(false);
+    failCount.current = 0;
     emit("开始：批量 OCR（断点续跑）", "muted");
     try {
       const end = endText.trim() === "" ? undefined : Number(endText);
@@ -111,23 +179,48 @@ export function BatchView() {
       );
       setJobId(r.job_id);
       stopPoll();
-      timer.current = window.setInterval(() => poll(r.job_id), 2000);
-      await poll(r.job_id);
+      schedule(r.job_id, 0);
     } catch (e) {
       setPhase("error");
-      setError(e instanceof Error ? e.message : String(e));
+      setError(toZh(e));
       emit(`批量启动失败：${e instanceof Error ? e.message : e}`, "err");
     }
   }
 
   async function doCancel() {
     if (!jobId) return;
-    await jobCancel(jobId);
-    stopPoll();
-    emit("已请求取消（当前页跑完后停止）", "warn");
+    setPhase("stopping");
+    try {
+      await jobCancel(jobId);
+    } catch (e) {
+      emit(`取消请求失败：${e instanceof Error ? e.message : e}`, "err");
+    }
+    // 真取消：在途页跑完即停；继续轮询直到后端回 cancelled，不擅自停转。
+    emit("正在停止…（在途页跑完即停，已落盘的不再涨）", "warn");
+    schedule(jobId, 1000);
   }
 
-  const total = dry?.planned_pages ?? 0;
+  async function copyFailPages() {
+    if (!failPages || failPages.length === 0) return;
+    const text = failPages.map((p) => String(p.page_number ?? p.pno_0based + 1)).join(",");
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedFail(true);
+      emit(`已复制 ${failPages.length} 个失败页号`, "ok");
+    } catch (e) {
+      emit(`复制失败：${e instanceof Error ? e.message : e}`, "err");
+    }
+  }
+
+  const total = dry?.planned_pages ?? prog?.planned ?? 0;
+  const pct = prog?.pct ?? (total > 0 ? Math.round(((prog?.pages_ok ?? 0) / total) * 1000) / 10 : 0);
+  const running = phase === "running" || phase === "stopping";
+  // Boolean flags (not inline phase checks) so TS narrowing cannot hide the error branch.
+  const progressVisible =
+    phase === "idle" || running || phase === "done" || phase === "cancelled" || (phase === "error" && prog !== null);
+  const failListVisible =
+    (phase === "done" || phase === "cancelled" || phase === "error") && failPages !== null;
+  const doneVisible = phase === "done" || phase === "cancelled";
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 p-4">
@@ -160,6 +253,10 @@ export function BatchView() {
           {dry && (
             <p className="text-[13px] tabular" role="status">
               全书 {dry.total_pages} 页，本次计划 {dry.planned_pages} 页
+              {(dry.done_pages ?? 0) > 0 && (
+                <> · 已完成 {dry.done_pages} 页，还剩 {dry.remaining ?? "?"} 页（开始即续跑）</>
+              )}
+              {dry.book_dir && <><br />书目录：{dry.book_dir}</>}
             </p>
           )}
           <p className="text-xs leading-5 text-muted-foreground" role="status">
@@ -169,12 +266,14 @@ export function BatchView() {
           </p>
         </CardContent>
         <CardFooter>
-          <Button variant="outline" onClick={doDry} disabled={phase === "loading" || phase === "running"}>
+          <Button variant="outline" onClick={doDry} disabled={phase === "loading" || running}>
             规划页数
           </Button>
           <span className="ml-auto flex gap-2">
-            {phase === "running" ? (
-              <Button variant="destructive" onClick={doCancel}>取消任务</Button>
+            {running ? (
+              <Button variant="destructive" onClick={doCancel} disabled={phase === "stopping"}>
+                {phase === "stopping" ? "正在停止…" : "取消任务"}
+              </Button>
             ) : (
               <Button onClick={doRun}>开始批量</Button>
             )}
@@ -194,25 +293,62 @@ export function BatchView() {
             </div>
           )}
           {phase === "error" && (
-            <EmptyState icon={Layers} tone="error" title="出错了" description={error} actionLabel="重试 Dry-Run" onAction={doDry} />
+            <EmptyState
+              icon={Layers} tone="error" title="出错了" description={error}
+              actionLabel={jobId ? "继续轮询" : "重试 Dry-Run"}
+              onAction={() => { if (jobId) { failCount.current = 0; schedule(jobId, 0); } else void doDry(); }}
+            />
           )}
-          {(phase === "idle" || phase === "running" || phase === "done") && (
+          {phase === "cancelled" && (
+            <EmptyState
+              icon={Layers} tone="idle" title="已取消" description="在途页已跑完，排队页已丢弃。已落盘的不再涨，重跑自动续上。"
+              actionLabel="继续跑（续上）" onAction={doRun}
+            />
+          )}
+          {progressVisible && (
             <>
               <p className="text-[13px] tabular" role="status">
-                成功 {prog?.pages_ok ?? 0} 页 · tokens {prog?.tokens ?? 0} · skipped {prog?.skipped ?? 0} ·
+                成功 {prog?.pages_ok ?? 0} 页 / 计划 {total || "?"} 页（{pct ?? 0}%）
+                {" · "}tokens {prog?.tokens ?? 0} · skipped {prog?.skipped ?? 0} ·
                 failed {prog?.failed ?? 0}
                 {(prog?.p50_ms ?? 0) > 0 && <> · p50 {prog?.p50_ms}ms p95 {prog?.p95_ms}ms</>}
               </p>
               <Progress value={prog?.pages_ok ?? 0} max={total > 0 ? total : 100} />
+              <p className="text-xs tabular text-muted-foreground" role="status">
+                速度 {prog?.pages_per_min ?? 0} 页/分 · 剩余 {fmtEta(prog?.eta_ms)} · 已用 {fmtElapsed(prog?.elapsed_ms)}
+                {(prog?.concurrency_current ?? 0) > 0 && <> · 并发 {prog?.concurrency_current}/{prog?.concurrency_init}</>}
+                {(prog?.n429 ?? 0) > 0 && <> · 429 共 {prog?.n429} 次（已自动降并发）</>}
+              </p>
               {phase === "idle" && !prog && (
                 <EmptyState icon={Layers} tone="idle" title="尚未开始" description="跑的过程中自动轮询实时数字；中断后重跑自动续上。" />
               )}
-              {phase === "done" && summary && (
+              {doneVisible && summary && (
                 <p className="text-[13px] text-muted-foreground">
-                  完成：tokens {String(summary.total_tokens ?? "?")}，本轮失败{" "}
+                  {phase === "cancelled" ? "已取消：" : "完成："}tokens {String(summary.total_tokens ?? "?")}，本轮失败{" "}
                   {String(summary.failed_pages_this_run ?? "?")} 页。
                   {summary.merged_md ? ` 整本 Markdown：${String(summary.merged_md)}` : " 未合并出整本 Markdown（pages/ 下还没有页文件）。"}
                 </p>
+              )}
+              {failListVisible && (
+                <div className="flex flex-col gap-1.5">
+                  <p className="text-[13px]" role="status">
+                    失败页 {failTotal} 页{failPages!.length > 0 ? `（前 ${failPages!.length} 页如下）` : ""}
+                    {failPages!.length > 0 && (
+                      <Button variant="outline" size="sm" className="ml-2" onClick={copyFailPages}>
+                        {copiedFail ? "已复制" : "复制页号"}
+                      </Button>
+                    )}
+                  </p>
+                  {failPages!.length > 0 && (
+                    <ul className="max-h-40 list-disc overflow-y-auto pl-5 text-xs leading-5">
+                      {failPages!.slice(0, 50).map((p) => (
+                        <li key={p.pno_0based} className="break-all font-mono">
+                          p{p.pno_0based}（第{p.page_number ?? p.pno_0based + 1}页）{p.http_status ? ` HTTP ${p.http_status}` : ""}{p.error ? ` ${p.error}` : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
               )}
             </>
           )}

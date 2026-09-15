@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { FileText, Save } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { FileText, Save, Copy, XCircle } from "lucide-react";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -8,7 +8,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/EmptyState";
 import { useSession } from "@/stores/session";
 import { useLog } from "@/stores/log";
-import { ocrImage, ocrPdfPage, ocrUrl, fileB64 } from "@/lib/engine";
+import { ocrImage, ocrPdfPage, ocrUrl, fileB64, type OcrRes } from "@/lib/engine";
+import { toZh } from "@/lib/errors";
 import { pickFile, PDF_FILTER, IMAGE_FILTER } from "@/lib/pick";
 
 type Kind = "image" | "pdf-page" | "image-url";
@@ -18,6 +19,17 @@ async function readImageB64(path: string): Promise<string> {
   const r = await fileB64(path);
   return r.b64;
 }
+
+function stampName(prefix: string, ext: string): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${prefix}-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}.${ext}`;
+}
+
+function safeName(s: string): string {
+  return s.replace(/[\\/:*?"<>|]/g, "_").slice(0, 60) || "page";
+}
+
 export function SingleView() {
   const s = useSession();
   const emit = useLog((x) => x.emit);
@@ -29,54 +41,110 @@ export function SingleView() {
   const [markdown, setMarkdown] = useState("");
   const [preview, setPreview] = useState("");
   const [error, setError] = useState("");
+  const [elapsed, setElapsed] = useState<number | null>(null);
+  const [waited, setWaited] = useState(0);
+  const [copied, setCopied] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
+  const tickRef = useRef<number | null>(null);
+
+  function stopTick() {
+    if (tickRef.current !== null) {
+      window.clearInterval(tickRef.current);
+      tickRef.current = null;
+    }
+  }
+
+  useEffect(() => stopTick, []);
 
   async function chooseFile() {
     const sel = await pickFile(kind === "pdf-page" ? PDF_FILTER : IMAGE_FILTER);
     if (sel) setPath(sel);
   }
 
+  function cancel() {
+    abortRef.current?.abort();
+  }
+
   async function run() {
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    // Hard cap: server timeout + 15s headroom so a hung socket cannot spin forever.
+    const cap = window.setTimeout(() => ctrl.abort(), s.timeout * 1000 + 15000);
+    const t0 = Date.now();
+    setWaited(0);
+    stopTick();
+    tickRef.current = window.setInterval(() => setWaited(Math.floor((Date.now() - t0) / 1000)), 500);
     setPhase("loading");
     setError("");
     setPreview("");
+    setElapsed(null);
+    setCopied(false);
     emit("开始：单页 OCR", "muted");
     try {
       const p = {
         baseUrl: s.baseUrl, model: s.model, key: s.apiKey,
         endpoint: s.endpoint, detail: s.detail, timeout: s.timeout,
       };
+      let r: OcrRes;
       if (kind === "image-url") {
         if (!url.trim()) throw new Error("请填写远端 URL");
-        const r = await ocrUrl(p, url.trim(), s.ocrPrompt);
+        r = await ocrUrl(p, url.trim(), s.ocrPrompt, ctrl.signal);
         setMarkdown(r.markdown);
       } else if (kind === "pdf-page") {
         if (!path.trim()) throw new Error("请选择有效 PDF（服务端可读路径）");
-        const r = await ocrPdfPage(p, path.trim(), pno, s.dpi, s.ocrPrompt);
+        r = await ocrPdfPage(p, path.trim(), pno, s.dpi, s.ocrPrompt, ctrl.signal);
         setMarkdown(r.markdown);
         if (r.png_b64_preview) setPreview(r.png_b64_preview);
       } else {
         if (!path.trim()) throw new Error("请选择有效图片");
         const b64 = await readImageB64(path.trim());
-        const r = await ocrImage(p, b64, s.ocrPrompt);
+        if (ctrl.signal.aborted) return;
+        r = await ocrImage(p, b64, s.ocrPrompt, ctrl.signal);
         setMarkdown(r.markdown);
       }
+      if (!r!.markdown.trim()) {
+        throw new Error(JSON.stringify({ error_code: "EMPTY_OUTPUT" }) + " 模型返回空：调大 max_output_tokens 或把 reasoning 降到 low 后重试。");
+      }
+      setElapsed(r!.elapsed_ms ?? Date.now() - t0);
       setPhase("done");
-      emit("单页 OCR 完成", "ok");
+      emit(`单页 OCR 完成${r!.elapsed_ms != null ? `（${r!.elapsed_ms}ms）` : ""}`, "ok");
     } catch (e) {
+      if ((e instanceof DOMException && e.name === "AbortError") || ctrl.signal.aborted) {
+        setPhase("idle");
+        emit("单页 OCR 已取消", "warn");
+        return;
+      }
       setPhase("error");
-      setError(e instanceof Error ? e.message : String(e));
+      const zh = toZh(e);
+      setError(zh);
       emit(`单页 OCR 失败：${e instanceof Error ? e.message : e}`, "err");
+    } finally {
+      window.clearTimeout(cap);
+      stopTick();
+      if (abortRef.current === ctrl) abortRef.current = null;
     }
   }
 
   function save() {
+    const src = kind === "image-url" ? safeName(url.trim().split("/").pop() || "url") : safeName((path.trim().split(/[\\/]/).pop() || "page").replace(/\.[^.]+$/, ""));
     const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = "page.md";
+    a.download = stampName(`ocr-${src}${kind === "pdf-page" ? `-p${pno}` : ""}`, "md");
     a.click();
     URL.revokeObjectURL(a.href);
-    emit("已保存 page.md", "ok");
+    emit(`已保存 ${a.download}`, "ok");
+  }
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(markdown);
+      setCopied(true);
+      emit("识别结果已复制", "ok");
+    } catch (e) {
+      emit(`复制失败：${e instanceof Error ? e.message : e}`, "err");
+    }
   }
 
   return (
@@ -136,7 +204,14 @@ export function SingleView() {
             {s.ocrPrompt.trim()
               ? `使用自定义提示词（${s.ocrPrompt.length} 字，在「参数」页编辑）`
               : "使用默认提示词（可在「参数」页自定义）"}
+            {phase === "loading" && ` · 已等待 ${waited}s / 超时 ${s.timeout}s`}
+            {elapsed != null && phase === "done" && ` · 耗时 ${elapsed}ms`}
           </p>
+          {s.ocrPrompt.length > 8000 && (
+            <p role="note" className="text-xs leading-5 text-warn">
+              提示词已超 8k 字符，可能挤占输出窗口导致空返回。
+            </p>
+          )}
           {preview && (
             <img
               src={`data:image/png;base64,${preview}`}
@@ -146,13 +221,26 @@ export function SingleView() {
           )}
         </CardContent>
         <CardFooter className="justify-end">
-          <Button variant="outline" onClick={save} disabled={!markdown}>
-            <Save aria-hidden="true" />
-            保存结果…
-          </Button>
-          <Button className="ml-2" onClick={run} disabled={phase === "loading"}>
-            {phase === "loading" ? "识别中…" : "开始识别"}
-          </Button>
+          {phase === "loading" ? (
+            <Button variant="destructive" onClick={cancel}>
+              <XCircle aria-hidden="true" />
+              取消
+            </Button>
+          ) : (
+            <>
+              <Button variant="outline" onClick={copy} disabled={!markdown}>
+                <Copy aria-hidden="true" />
+                {copied ? "已复制" : "复制"}
+              </Button>
+              <Button variant="outline" onClick={save} disabled={!markdown}>
+                <Save aria-hidden="true" />
+                保存结果…
+              </Button>
+              <Button className="ml-2" onClick={run}>
+                开始识别
+              </Button>
+            </>
+          )}
         </CardFooter>
       </Card>
       <Card>
