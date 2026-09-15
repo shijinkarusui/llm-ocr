@@ -84,6 +84,10 @@ export interface OcrRes {
   elapsed_ms?: number;
   dpi_actual?: number;
   page_count?: number;
+  // P1: newer backend clamps pno and echoes it; prefer these over local state.
+  clamped?: boolean;
+  pno?: number;
+  page_number?: number;
 }
 
 /** Only send a prompt when the user actually customised one: an empty editor
@@ -120,13 +124,16 @@ export function ocrUrl(p: LlmParams, imageUrl: string, prompt?: string, signal?:
 export function ocrPdfPage(
   p: LlmParams, pdfPath: string, pno: number, dpi: number, prompt?: string, signal?: AbortSignal,
 ): Promise<OcrRes> {
+  // pno is 0-based in the UI; also send 1-based `page` so the backend clamps
+  // to [1, page_count] and echoes {pno, page_number, clamped} (P1).
+  const page1 = Math.floor(pno) + 1;
   return req<OcrRes>("/api/ocr/pdf-page", {
     method: "POST",
     signal,
     body: JSON.stringify({
       base_url: p.baseUrl, model: p.model, key: p.key,
       endpoint: p.endpoint, detail: p.detail, timeout: p.timeout,
-      pdf_path: pdfPath, pno, dpi,
+      pdf_path: pdfPath, pno: Math.max(0, Math.floor(pno)), page: page1, dpi,
       ...promptField(prompt),
     }),
   });
@@ -140,6 +147,10 @@ export interface DryRunRes {
   done_pages?: number;
   remaining?: number;
   book_json?: string | null;
+  // P1: backend echoes clamped range (optional: old backend omits them).
+  start?: number; end?: number | null;
+  requested_start?: number; requested_end?: number | null;
+  clamped?: boolean;
 }
 
 export function batchDryRun(pdfPath: string, outdir: string, start: number, end?: number): Promise<DryRunRes> {
@@ -174,6 +185,8 @@ export interface JobProgress {
   planned?: number; pct?: number; eta_ms?: number; pages_per_min?: number;
   elapsed_ms?: number; concurrency_current?: number; concurrency_init?: number;
   n429?: number;
+  // P1 searchable progress stage (optional: backend without it simply omits it).
+  stage?: string;
 }
 export interface JobRes {
   id: string; kind: string; label: string; status: string;
@@ -196,6 +209,31 @@ export function job(id: string): Promise<JobRes> {
 export function jobCancel(id: string): Promise<{ ok: boolean }> {
   return req<{ ok: boolean }>(`/api/jobs/${id}/cancel`, { method: "POST", body: "{}" });
 }
+export interface BatchRetryRes { job_id?: string; retried?: number[] }
+/** P1: retry only failed pages. Backend may 404/501 -> caller falls back to manual resume. */
+export function batchRetry(jobId: string): Promise<BatchRetryRes> {
+  return req<BatchRetryRes>("/api/batch/retry", {
+    method: "POST",
+    body: JSON.stringify({ job_id: jobId, only_failed: true }),
+  });
+}
+
+/** P1: PDF page thumbnail. pno is 1-based to match GET /api/pdf/preview. Backend 404 -> callers hide <img> onError. */
+export function pdfPreviewUrl(pdfPath: string, pno1Based: number, dpi = 120): string {
+  return `${ENGINE_BASE}/api/pdf/preview?path=${encodeURIComponent(pdfPath)}&pno=${pno1Based}&dpi=${dpi}`;
+}
+
+export interface JobListItem { id: string; kind?: string; label?: string; status?: string }
+/** P2: job history. Returns null when the backend has no /api/jobs list endpoint -> caller hides. */
+export async function listJobs(limit = 20): Promise<JobListItem[] | null> {
+  try {
+    const data = await req<JobListItem[] | { jobs?: JobListItem[] }>(`/api/jobs?limit=${limit}`);
+    if (Array.isArray(data)) return data;
+    return Array.isArray(data.jobs) ? data.jobs : null;
+  } catch {
+    return null;
+  }
+}
 
 export interface SearchableRunRes {
   job_id: string;
@@ -205,11 +243,11 @@ export interface SearchableRunRes {
   warnings?: string[];
 }
 export function searchableBuild(
-  pdfPath: string, outdir: string, geoSource: string, keywords: string[],
+  pdfPath: string, outdir: string, geoSource: string, keywords: string[], dpi = 150,
 ): Promise<SearchableRunRes> {
   return req<SearchableRunRes>("/api/searchable/build", {
     method: "POST",
-    body: JSON.stringify({ pdf_path: pdfPath, outdir, geo_source: geoSource, keywords }),
+    body: JSON.stringify({ pdf_path: pdfPath, outdir, geo_source: geoSource, keywords, dpi }),
   });
 }
 

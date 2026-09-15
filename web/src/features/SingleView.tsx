@@ -8,7 +8,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/EmptyState";
 import { useSession } from "@/stores/session";
 import { useLog } from "@/stores/log";
-import { ocrImage, ocrPdfPage, ocrUrl, fileB64, type OcrRes } from "@/lib/engine";
+import { ocrImage, ocrPdfPage, ocrUrl, fileB64, pdfPreviewUrl, type OcrRes } from "@/lib/engine";
 import { toZh } from "@/lib/errors";
 import { pickFile, PDF_FILTER, IMAGE_FILTER } from "@/lib/pick";
 
@@ -37,6 +37,11 @@ export function SingleView() {
   const [path, setPath] = useState("");
   const [url, setUrl] = useState("");
   const [pno, setPno] = useState(0);
+  // P1: user-facing 1-based page input; pno (0-based) stays the wire value.
+  const [page1, setPage1] = useState(1);
+  const [pageCount, setPageCount] = useState<number | null>(null);
+  const [clampNote, setClampNote] = useState("");
+  const [thumbOk, setThumbOk] = useState(true);
   const [phase, setPhase] = useState<Phase>("idle");
   const [markdown, setMarkdown] = useState("");
   const [preview, setPreview] = useState("");
@@ -58,7 +63,12 @@ export function SingleView() {
 
   async function chooseFile() {
     const sel = await pickFile(kind === "pdf-page" ? PDF_FILTER : IMAGE_FILTER);
-    if (sel) setPath(sel);
+    if (sel) {
+      setPath(sel);
+      setThumbOk(true);
+      setPageCount(null);
+      setClampNote("");
+    }
   }
 
   function cancel() {
@@ -80,6 +90,7 @@ export function SingleView() {
     setPreview("");
     setElapsed(null);
     setCopied(false);
+    setClampNote("");
     emit("开始：单页 OCR", "muted");
     try {
       const p = {
@@ -93,9 +104,32 @@ export function SingleView() {
         setMarkdown(r.markdown);
       } else if (kind === "pdf-page") {
         if (!path.trim()) throw new Error("请选择有效 PDF（服务端可读路径）");
-        r = await ocrPdfPage(p, path.trim(), pno, s.dpi, s.ocrPrompt, ctrl.signal);
+        // P1: 1-based clamp up front (backend still validates; its `clamped` wins below).
+        let pno0 = Math.max(0, page1 - 1);
+        if (pageCount != null) {
+          const c1 = Math.min(Math.max(page1, 1), pageCount);
+          if (c1 !== page1) {
+            setPage1(c1);
+            setClampNote(`已钳制到 1..${pageCount}`);
+          }
+          pno0 = c1 - 1;
+          setPno(pno0);
+        } else if (pno0 !== pno) {
+          setPno(pno0);
+        }
+        r = await ocrPdfPage(p, path.trim(), pno0, s.dpi, s.ocrPrompt, ctrl.signal);
         setMarkdown(r.markdown);
         if (r.png_b64_preview) setPreview(r.png_b64_preview);
+        if (typeof r.page_count === "number" && Number.isFinite(r.page_count) && r.page_count > 0) {
+          setPageCount(r.page_count);
+          const bPno = typeof r.pno === "number" ? r.pno : (typeof r.page_number === "number" ? r.page_number - 1 : null);
+          if (r.clamped || (bPno !== null && bPno !== pno0)) {
+            const b1 = (bPno ?? pno0) + 1;
+            setPage1(b1);
+            setPno(bPno ?? pno0);
+            setClampNote(`后端已钳制到第 ${b1} 页（共 ${r.page_count} 页）`);
+          }
+        }
       } else {
         if (!path.trim()) throw new Error("请选择有效图片");
         const b64 = await readImageB64(path.trim());
@@ -176,7 +210,17 @@ export function SingleView() {
           {kind !== "image-url" ? (
             <div className="flex items-center gap-2.5">
               <Label htmlFor="single-path">本地路径</Label>
-              <Input id="single-path" value={path} onChange={(e) => setPath(e.target.value)} placeholder="服务端可读路径" />
+              <Input
+                id="single-path"
+                value={path}
+                onChange={(e) => {
+                  setPath(e.target.value);
+                  setThumbOk(true);
+                  setPageCount(null);
+                  setClampNote("");
+                }}
+                placeholder="服务端可读路径"
+              />
               <Button variant="outline" size="sm" onClick={chooseFile}>
                 {kind === "pdf-page" ? "选 PDF…" : "选图片…"}
               </Button>
@@ -188,16 +232,45 @@ export function SingleView() {
             </div>
           )}
           {kind === "pdf-page" && (
-            <div className="flex items-center gap-2.5">
-              <Label htmlFor="single-pno">PDF 页码</Label>
-              <Input
-                id="single-pno"
-                className="w-24"
-                inputMode="numeric"
-                value={String(pno)}
-                onChange={(e) => setPno(Number(e.target.value) || 0)}
-              />
-              <span className="text-xs text-muted-foreground">从 0 开始数</span>
+            <div className="flex flex-col gap-1.5">
+              <div className="flex items-center gap-2.5">
+                <Label htmlFor="single-pno">PDF 页码</Label>
+                <Input
+                  id="single-pno"
+                  className="w-24"
+                  inputMode="numeric"
+                  value={String(page1)}
+                  onChange={(e) => {
+                    const raw = Number(e.target.value) || 1;
+                    if (pageCount != null) {
+                      const c1 = Math.min(Math.max(raw, 1), pageCount);
+                      setPage1(c1);
+                      setPno(c1 - 1);
+                      setClampNote(c1 !== raw ? `已钳制到 1..${pageCount}` : "");
+                    } else {
+                      const c1 = Math.max(1, raw);
+                      setPage1(c1);
+                      setPno(c1 - 1);
+                      setClampNote(c1 !== raw ? "已钳制到 1..N（总页数未知，先按 1 起算）" : "");
+                    }
+                    setThumbOk(true);
+                  }}
+                />
+                <span className="text-xs text-muted-foreground">
+                  第 1 页起{pageCount != null ? `，共 ${pageCount} 页` : "（识别后可知总页数）"}
+                </span>
+              </div>
+              {clampNote && (
+                <p role="status" className="text-xs leading-5 text-warn">{clampNote}</p>
+              )}
+              {path.trim() && thumbOk && (
+                <img
+                  src={pdfPreviewUrl(path.trim(), pno + 1, 120)}
+                  alt="PDF 预览缩略图"
+                  className="max-h-40 self-start rounded-md border object-contain"
+                  onError={() => setThumbOk(false)}
+                />
+              )}
             </div>
           )}
           <p role="status" className="text-xs leading-5 text-muted-foreground">

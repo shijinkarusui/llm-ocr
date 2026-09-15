@@ -302,9 +302,10 @@ def _job_failed_pages(job, status="failed"):
 
 def _new_job(kind, label):
     jid = uuid.uuid4().hex[:12]
+    now = time.time()
     with JOBS_LOCK:
         JOBS[jid] = {"id": jid, "kind": kind, "label": label, "status": "queued",
-                     "created": time.time(), "started_at": time.time(), "cancel": False}
+                     "created": now, "created_at": now, "started_at": now, "cancel": False}
     return jid
 
 
@@ -322,6 +323,68 @@ def _job_get(jid):
 def _job_cancelled(jid):
     with JOBS_LOCK:
         return bool((JOBS.get(jid) or {}).get("cancel"))
+
+
+def _find_job_by_outdir(outdir):
+    """Most recent job whose book_dir/outdir equals `outdir` (for outdir-only retry)."""
+    want = str(outdir or "").strip()
+    if not want:
+        return None
+    best = None
+    best_ts = -1.0
+    with JOBS_LOCK:
+        items = list(JOBS.values())
+    for j in items:
+        hit = any(str((j or {}).get(k) or "").strip() == want for k in ("book_dir", "outdir"))
+        if not hit:
+            continue
+        try:
+            ts = float((j or {}).get("created_at") or (j or {}).get("created") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts >= best_ts:
+            best_ts = ts
+            best = dict(j)
+    return best
+
+
+def _clamp_pno_1based(requested, page_count):
+    """1-based clamp for single-page APIs: returns (pno_0based, page_1based, clamped)."""
+    try:
+        req = int(requested)
+    except (TypeError, ValueError):
+        raise ValueError("pno must be an integer")
+    total = int(page_count)
+    if total <= 0:
+        raise ValueError("empty PDF")
+    page_1 = min(max(req, 1), total)
+    return page_1 - 1, page_1, (page_1 != req)
+
+
+def _coerce_dpi(value, default=150):
+    """DPI for preview/searchable APIs: int in 72..300, else ValueError."""
+    try:
+        dpi = int(value) if value is not None and str(value).strip() != "" else int(default)
+    except (TypeError, ValueError, AttributeError):
+        raise ValueError("dpi must be an integer in 72..300")
+    if dpi < 72 or dpi > 300:
+        raise ValueError("dpi out of range 72..300")
+    return dpi
+
+
+def _render_page_png(pdf_path, pno_0based, dpi):
+    """Render one page to PNG bytes (prefers src/pdf_render.py, falls back to src/render.py)."""
+    render_fn = None
+    try:
+        from pdf_render import render_page as render_fn  # type: ignore
+    except ImportError:
+        render_fn = None
+    if render_fn is None:
+        try:
+            from render import render_page as render_fn  # type: ignore
+        except ImportError:
+            from src.render import render_page as render_fn  # type: ignore
+    return render_fn(str(pdf_path), int(pno_0based), int(dpi))
 
 
 def _run_batch_job(jid, pdf_path, outdir, kw, cleanup=None):
@@ -355,11 +418,21 @@ def _run_batch_job(jid, pdf_path, outdir, kw, cleanup=None):
                 pass
 
 
-def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords, book_dir=None):
+def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords, book_dir=None, dpi=150):
     import fitz
     from make_searchable import make_searchable
     from verify_searchable import verify, verify_alignment
+    try:
+        dpi = _coerce_dpi(dpi, default=150)
+    except ValueError:
+        dpi = 150
+    def _stage(name, pct):
+        try:
+            _job_set(jid, status="running", progress={"stage": name, "pct": int(pct)})
+        except Exception:
+            pass
     _job_set(jid, status="running")
+    _stage("boxes", 5)
     try:
         root = Path(out_dir)
         pages = sorted(Path(pages_dir).glob("page_*.md"),
@@ -367,6 +440,7 @@ def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords,
         if not pages:
             raise ValueError("no pages/page_*.md under %s" % pages_dir)
         md = {int(p.stem.split("_")[1]): p.read_text(encoding="utf-8") for p in pages}
+        _stage("boxes", 20)
         with fitz.open(str(pdf_path)) as doc:
             total = doc.page_count
         # P0 structured missing pages: machine-readable list + resume hint.
@@ -381,9 +455,12 @@ def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords,
             return
         target = root / "book_searchable.pdf"
         align_out = root / "align"
+        _stage("render", 40)
         make_searchable(pdf_path, list(range(total)), md, None, target,
-                        geo_source=geo_source, align_out=align_out)
+                        geo_source=geo_source, align_out=align_out, dpi=dpi)
+        _stage("embed", 65)
         res = verify(target, keywords) if keywords else {}
+        _stage("verify", 85)
         # P0 alignment verification: run against the exact align artifacts this
         # build just wrote (boxes.json + align_report.json), not keyword search.
         align_report = None
@@ -422,10 +499,12 @@ def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords,
             except Exception as exc:  # noqa: BLE001
                 out["book_json_error"] = "%s: %s" % (type(exc).__name__, exc)
         if _job_cancelled(jid):
-            _job_set(jid, status="cancelled", result=out)
+            _job_set(jid, status="cancelled", result=out,
+                     progress={"stage": "done", "pct": 100})
             log("searchable job %s cancelled" % jid)
             return
-        _job_set(jid, status="done", result=out)
+        _job_set(jid, status="done", result=out,
+                 progress={"stage": "done", "pct": 100})
         log("searchable job %s done pages=%d" % (jid, total))
     except Exception as exc:  # noqa: BLE001
         _job_set(jid, status="error", error="%s: %s" % (type(exc).__name__, exc))
@@ -521,6 +600,61 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"base_url": base_url, "model": model,
                                  "key": masked_key(key), "endpoint": endpoint,
                                  "detail": detail})
+            elif path == "/api/jobs":
+                try:
+                    limit = int((qs.get("limit") or ["50"])[0])
+                except (TypeError, ValueError):
+                    limit = 50
+                limit = max(1, min(200, limit))
+                with JOBS_LOCK:
+                    items = [dict(j) for j in JOBS.values()]
+                items.sort(key=lambda j: float(j.get("created_at") or j.get("created") or 0), reverse=True)
+                slim = [{"id": j.get("id"), "kind": j.get("kind"), "label": j.get("label"),
+                         "status": j.get("status"), "created_at": j.get("created_at") or j.get("created")} for j in items[:limit]]
+                for _full, _s in zip(items[:limit], slim):
+                    for _k in ("planned", "total_pages", "book_dir", "outdir", "progress"):
+                        if _k in _full:
+                            _s[_k] = _full[_k]
+                self._send(200, {"jobs": slim, "total": len(items)})
+            elif path == "/api/pdf/preview":
+                pdf = ((qs.get("path") or qs.get("pdf_path") or [""])[0] or "").strip()
+                if not pdf or not Path(pdf).is_file():
+                    self._send_error(404, "NOT_FOUND", "pdf not found", "PDF路径不存在（服务端本地路径）", "check path (server-side path)")
+                    return
+                try:
+                    dpi = _coerce_dpi((qs.get("dpi") or ["150"])[0], default=150)
+                except ValueError as exc:
+                    self._send_error(400, "BAD_DPI", str(exc), "DPI 只允许 72-300", "send dpi in 72..300")
+                    return
+                import fitz as _pv_fitz
+                try:
+                    with _pv_fitz.open(str(pdf)) as _doc:
+                        _total = _doc.page_count
+                except Exception as exc:
+                    self._send_error(400, "BAD_EXTRA_JSON", "%s: %s" % (type(exc).__name__, exc), "PDF打不开", "check pdf file")
+                    return
+                if _total <= 0:
+                    self._send_error(404, "EMPTY_PDF", "empty PDF (0 pages)", "PDF 页数为 0", "check pdf file")
+                    return
+                try:
+                    pno_0, _page1, _cl = _clamp_pno_1based((qs.get("pno") or ["1"])[0], _total)
+                except ValueError as exc:
+                    self._send_error(400, "BAD_EXTRA_JSON", str(exc), "页码必须是整数", "send integer pno (1-based)")
+                    return
+                if _cl:
+                    self._send_error(404, "PAGE_OUT_OF_RANGE", "pno out of range 1..%d" % _total, "页码越界（共 %d 页）" % _total, "use pno in 1..%d" % _total)
+                    return
+                try:
+                    png = _render_page_png(pdf, pno_0, dpi)
+                except Exception as exc:
+                    self._send_error(500, "UNKNOWN", "%s: %s" % (type(exc).__name__, exc), "渲染失败", "retry later")
+                    return
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(png)))
+                self.end_headers()
+                self.wfile.write(png)
             elif path.startswith("/api/jobs/") and not path.endswith("/cancel"):
                 jid = path[len("/api/jobs/"):]
                 if "/" in jid:
@@ -591,6 +725,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_dry_run(data)
             elif path == "/api/batch/run":
                 self._handle_batch_run(data)
+            elif path == "/api/batch/retry":
+                self._handle_batch_retry(data)
             elif path == "/api/searchable/build":
                 self._handle_searchable(data)
             elif path == "/api/book/resolve":
@@ -732,6 +868,15 @@ class Handler(BaseHTTPRequestHandler):
         from ocr_page import ocr_pdf_page
         _ensure_prompt_module()
         from render import render_page
+        # P1: accept both 0-based `pno` and 1-based `pno`/`page`/`page_number`;
+        # a 1-based-looking key wins only when it is explicitly present.
+        pno_raw = data.get("pno", 0)
+        one_based = False
+        for _k in ("page", "page_number", "page_1based", "pno_1based"):
+            if data.get(_k) is not None and str(data.get(_k)).strip() != "":
+                pno_raw = data.get(_k)
+                one_based = True
+                break
         try:
             llm, extra = _llm_kwargs(data)
         except ValueError as exc:
@@ -740,11 +885,6 @@ class Handler(BaseHTTPRequestHandler):
         pdf = (data.get("pdf_path") or "").strip()
         if not pdf or not Path(pdf).is_file():
             self._send_error(400, "BAD_EXTRA_JSON", "pdf_path must be an existing file", "PDF路径不存在", "check pdf_path (server-side path)")
-            return
-        try:
-            pno = int(data.get("pno", 0))
-        except (TypeError, ValueError):
-            self._send_error(400, "BAD_EXTRA_JSON", "pno must be an integer", "页码必须是整数", "send integer pno (0-based)")
             return
         try:
             dpi = int(data.get("dpi") or 200)
@@ -757,8 +897,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_error(400, "BAD_EXTRA_JSON", "%s: %s" % (type(exc).__name__, exc), "PDF打不开", "check pdf file")
             return
-        if pno < 0 or pno >= _page_count:
-            self._send_error(400, "BAD_EXTRA_JSON", "pno out of range 0..%d" % (_page_count - 1), "页码越界", "use pno in 0..%d" % (_page_count - 1))
+        if _page_count <= 0:
+            self._send_error(422, "EMPTY_PDF", "empty PDF (0 pages)", "PDF 页数为 0", "check pdf file")
+            return
+        # P1: 1-based clamp to [1, page_count]; legacy 0-based pno keeps working.
+        try:
+            if one_based:
+                pno, page_1, clamped = _clamp_pno_1based(pno_raw, _page_count)
+                requested_pno = int(pno_raw)
+            else:
+                requested_pno = int(pno_raw)
+                if requested_pno < 0:
+                    pno, page_1, clamped = 0, 1, True
+                elif requested_pno >= _page_count:
+                    pno, page_1, clamped = _page_count - 1, _page_count, True
+                else:
+                    pno, page_1, clamped = requested_pno, requested_pno + 1, False
+        except (TypeError, ValueError):
+            self._send_error(400, "BAD_EXTRA_JSON", "pno must be an integer", "页码必须是整数", "send integer pno")
             return
         t0 = _time.monotonic()
         try:
@@ -774,22 +930,64 @@ class Handler(BaseHTTPRequestHandler):
         if not (text or "").strip():
             self._send_error(422, "EMPTY_OUTPUT", "empty OCR output", "模型返回空: 调大max_output_tokens或改reasoning low", "raise max_output_tokens / set reasoning low", elapsed_ms=ms)
             return
-        self._send(200, {"markdown": text, "png_b64_preview": preview, "elapsed_ms": ms, "dpi_actual": dpi, "page_count": _page_count})
+        self._send(200, {"markdown": text, "png_b64_preview": preview, "elapsed_ms": ms, "dpi_actual": dpi, "page_count": _page_count, "pno": pno, "page_number": page_1, "requested_pno": requested_pno, "clamped": bool(clamped)})
 
     def _handle_dry_run(self, data):
         import fitz
         from batch_plan import book_output_dir, page_plan
         pdf = (data.get("pdf_path") or "").strip()
         if not pdf or not Path(pdf).is_file():
-            self._send_error(400, "BAD_EXTRA_JSON", "pdf_path must be an existing file", "PDF路径不存在（服务端本地路径）", "check pdf_path (server-side path)")
+            self._send_error(400, "BAD_EXTRA_JSON", "pdf_path must be an existing file", "PDF\u8def\u5f84\u4e0d\u5b58\u5728\uff08\u670d\u52a1\u7aef\u672c\u5730\u8def\u5f84\uff09", "check pdf_path (server-side path)")
+            return
+        try:
+            with fitz.open(str(pdf)) as _dry_doc:
+                total = _dry_doc.page_count
+        except Exception as exc:
+            self._send_error(400, "BAD_EXTRA_JSON", "%s: %s" % (type(exc).__name__, exc), "PDF\u6253\u4e0d\u5f00", "check pdf file")
+            return
+        if total <= 0:
+            self._send_error(422, "EMPTY_PDF", "empty PDF (0 pages)", "PDF \u9875\u6570\u4e3a 0", "check pdf file")
+            return
+        # P1: 1-based clamp - out-of-range pages clamp, never 4xx;
+        # only missing pdf / 0 pages go 4xx.
+        requested_pno = None
+        one_based_key = False
+        for _k in ("page", "page_number", "page_1based", "pno_1based"):
+            if data.get(_k) is not None and str(data.get(_k)).strip() != "":
+                requested_pno = data.get(_k)
+                one_based_key = True
+                break
+        try:
+            if one_based_key:
+                _pno0, _page1, _cl = _clamp_pno_1based(requested_pno, total)
+                requested_start, requested_end = _pno0, _pno0 + 1
+                start_c, end_c = _pno0, _pno0 + 1
+                clamped = bool(_cl)
+                requested_pno = int(requested_pno)
+            else:
+                _rs = data.get("start", 0)
+                if _rs is None or (isinstance(_rs, str) and _rs.strip() == ""):
+                    requested_start = 0
+                else:
+                    requested_start = int(_rs)
+                _re = data.get("end")
+                if _re is None or (isinstance(_re, str) and str(_re).strip() == ""):
+                    requested_end = None
+                else:
+                    requested_end = int(_re)
+                start_c = min(max(requested_start, 0), total)
+                if requested_end is None:
+                    end_c = None
+                else:
+                    end_c = min(max(requested_end, 0), total)
+                    if end_c < start_c:
+                        end_c = start_c
+                clamped = (start_c != requested_start) or (requested_end is not None and end_c != requested_end)
+        except (TypeError, ValueError):
+            self._send_error(400, "BAD_EXTRA_JSON", "start/end/pno must be integers", "\u8d77\u6b62\u9875\u5fc5\u987b\u662f\u6574\u6570", "send integer start/end (0-based) or page (1-based)")
             return
         outdir = (data.get("outdir") or "out/book_gui").strip() or "out/book_gui"
-        start = int(data.get("start") or 0)
-        end = data.get("end")
-        end = int(end) if end is not None and str(end).strip() != "" else None
-        plan = page_plan(Path(pdf), Path(outdir), start, end)
-        with fitz.open(str(pdf)) as doc:
-            total = doc.page_count
+        plan = page_plan(Path(pdf), Path(outdir), start_c, end_c)
         first5 = [{"pno_0based": i["pno_0based"], "page_number": i["page_number"]} for i in plan[:5]]
         # P0 resume visibility: done pages already on disk under the per-book root.
         book_dir = book_output_dir(Path(pdf), Path(outdir))
@@ -797,9 +995,16 @@ class Handler(BaseHTTPRequestHandler):
         done_pages = len(done_rows)
         book_json = str(book_dir / "book.json") if (book_dir / "book.json").is_file() else None
         # Per-book root the run will actually write to (pages/, usage.jsonl, book md).
-        self._send(200, {"total_pages": total, "planned_pages": len(plan), "first5": first5,
-                         "book_dir": str(book_dir), "done_pages": done_pages,
-                         "remaining": max(0, len(plan) - done_pages), "book_json": book_json})
+        resp = {"total_pages": total, "planned_pages": len(plan), "first5": first5,
+                "book_dir": str(book_dir), "done_pages": done_pages,
+                "remaining": max(0, len(plan) - done_pages), "book_json": book_json,
+                "start": start_c, "end": end_c,
+                "requested_start": requested_start, "requested_end": requested_end,
+                "clamped": bool(clamped)}
+        if one_based_key:
+            resp["requested_pno"] = requested_pno
+            resp["page_number"] = _page1
+        self._send(200, resp)
 
     def _handle_batch_run(self, data):
         import fitz as _batch_fitz
@@ -845,11 +1050,118 @@ class Handler(BaseHTTPRequestHandler):
         log("batch job %s started pdf=%s key=%s" % (jid, pdf, masked_key(llm["api_key"])))
         self._send(200, {"job_id": jid})
 
+    def _handle_batch_retry(self, data):
+        from batch_plan import book_output_dir, page_plan
+        jid_src = (data.get("job_id") or "").strip() if isinstance(data.get("job_id"), str) else data.get("job_id")
+        outdir_arg = (data.get("outdir") or "").strip() if isinstance(data.get("outdir"), str) else ""
+        only_failed = data.get("only_failed", True)
+        if isinstance(only_failed, str):
+            only_failed = only_failed.strip().lower() not in ("0", "false", "no", "")
+        else:
+            only_failed = bool(only_failed)
+        job = _job_get(jid_src) if jid_src else None
+        if job is None and outdir_arg:
+            job = _find_job_by_outdir(outdir_arg)
+            if job is not None:
+                jid_src = job.get("id")
+        if job is None:
+            self._send_error(400, "MISSING_ARG", "job_id or outdir is required", "缺少 job_id 或 outdir 参数", "send job_id (or outdir)")
+            return
+        pdf = str((job.get("source_pdf") or job.get("pdf_path") or "")).strip()
+        outdir = str((job.get("outdir") or outdir_arg or "")).strip()
+        if not pdf or not Path(pdf).is_file():
+            book_dir = str((job.get("book_dir") or outdir or "")).strip()
+            bj = Path(book_dir) / "book.json" if book_dir else None
+            if bj is not None and bj.is_file():
+                try:
+                    rec = json.loads(bj.read_text(encoding="utf-8"))
+                    cand = str((rec or {}).get("source_pdf") or "").strip()
+                    if cand and Path(cand).is_file():
+                        pdf = cand
+                except (ValueError, OSError):
+                    pass
+        if not pdf or not Path(pdf).is_file():
+            self._send_error(400, "MISSING_ARG", "source PDF unknown for this job", "该任务找不到源 PDF（book.json 无记录）", "send pdf_path with outdir, or rerun batch")
+            return
+        if not outdir:
+            self._send_error(400, "MISSING_ARG", "outdir is required", "缺少 outdir 参数", "send outdir")
+            return
+        if not only_failed:
+            self._send_error(400, "MISSING_ARG", "only_failed must be true", "当前仅支持 only_failed:true 的失败页重试", "send only_failed:true")
+            return
+        failed_rows = _job_failed_pages(job, status="failed")
+        retried_1based = sorted({int(r.get("page_number") or 0) for r in failed_rows if int(r.get("page_number") or 0) > 0})
+        if not retried_1based:
+            self._send(200, {"job_id": jid_src, "retried": [], "job": _job_get(jid_src)})
+            return
+        llm, extra = _llm_kwargs(data)
+        prompt_file = str(_res_file("prompts", "ocr_system.md"))
+        cleanup = None
+        custom_prompt = _request_prompt(data)
+        if custom_prompt is not None:
+            import os
+            import tempfile
+            fd, tmp = tempfile.mkstemp(prefix="llmocr_prompt_", suffix=".md")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(custom_prompt)
+            prompt_file = tmp
+            cleanup = tmp
+        try:
+            dpi = int(data.get("dpi") or job.get("dpi") or 200)
+        except (TypeError, ValueError):
+            dpi = 200
+        try:
+            concurrency = int(data.get("concurrency") or job.get("concurrency") or 4)
+        except (TypeError, ValueError):
+            concurrency = 4
+        try:
+            retries = int(data.get("retries") if data.get("retries") is not None else job.get("retries") if job.get("retries") is not None else 2)
+        except (TypeError, ValueError):
+            retries = 2
+        kw = dict(dpi=dpi, concurrency=concurrency, retries=retries,
+                  start=min(r - 1 for r in retried_1based), end=max(retried_1based),
+                  base_url=llm["base_url"] or job.get("base_url"), model=llm["model"] or job.get("model"),
+                  prompt_path=prompt_file,
+                  api_key=llm["api_key"] or job.get("api_key") or "",
+                  endpoint=data.get("endpoint") or job.get("endpoint") or "responses",
+                  detail=llm["detail"] or job.get("detail") or "high",
+                  extra=extra or job.get("extra"), timeout=data.get("timeout") if data.get("timeout") is not None else job.get("timeout"))
+        # Delete the failed page files so run_batch re-OCRs them instead of
+        # emitting `skipped` sentinels (existing non-empty outputs are skipped).
+        book_dir = str(book_output_dir(Path(pdf), Path(outdir)))
+        for _p1 in retried_1based:
+            try:
+                (Path(book_dir) / "pages" / ("page_%04d.md" % (_p1 - 1))).unlink(missing_ok=True)
+            except OSError:
+                pass
+        jid = _new_job("batch", "retry %s (%d pages)" % (Path(pdf).name, len(retried_1based)))
+        _job_set(jid, outdir=outdir, book_dir=book_dir, source_pdf=pdf,
+                 planned=len(retried_1based), retried_from=jid_src, retried_pages=retried_1based,
+                 dpi=dpi, concurrency=concurrency, retries=retries,
+                 base_url=kw.get("base_url"), model=kw.get("model"),
+                 endpoint=kw.get("endpoint"), detail=kw.get("detail"),
+                 extra=kw.get("extra"), timeout=kw.get("timeout"))
+        try:
+            import fitz as _retry_fitz
+            with _retry_fitz.open(str(pdf)) as _doc:
+                _job_set(jid, total_pages=_doc.page_count)
+        except Exception:
+            pass
+        threading.Thread(target=_run_batch_job,
+                         args=(jid, pdf, outdir, kw, cleanup), daemon=True).start()
+        log("batch retry job %s from %s pages=%s" % (jid, jid_src, retried_1based))
+        self._send(200, {"job_id": jid, "retried": retried_1based, "job": _job_get(jid)})
+
     def _handle_searchable(self, data):
         from batch_plan import book_output_dir
         from book_id import resolve_book
         pdf = (data.get("pdf_path") or "").strip()
         outdir = (data.get("outdir") or "").strip()
+        try:
+            dpi = _coerce_dpi(data.get("dpi", 150), default=150)
+        except ValueError as exc:
+            self._send_error(400, "BAD_DPI", str(exc), "DPI 只允许 72-300", "send dpi in 72..300")
+            return
         if not outdir or not Path(outdir).is_dir():
             self._send_error(400, "BAD_EXTRA_JSON", "outdir must contain pages/page_*.md", "输出目录不存在或没有 pages（服务端本地路径）", "check outdir (server-side path)")
             return
@@ -885,10 +1197,10 @@ class Handler(BaseHTTPRequestHandler):
         jid = _new_job("searchable", "searchable %s" % Path(pdf_use).name)
         _job_set(jid, outdir=outdir, book_dir=resolved.get("book_dir"),
                  source_pdf=pdf_use, bind_status=resolved["status"],
-                 warnings=resolved.get("warnings") or [])
+                 warnings=resolved.get("warnings") or [], dpi=dpi, geo_source=geo)
         threading.Thread(target=_run_searchable_job,
                          args=(jid, pdf_use, pages_dir, job_book_dir, geo, kws,
-                               resolved.get("book_dir")), daemon=True).start()
+                               resolved.get("book_dir"), dpi), daemon=True).start()
         log("searchable job %s started pdf=%s bind=%s" % (jid, pdf_use, resolved["status"]))
         self._send(200, {"job_id": jid, "status": resolved["status"],
                          "book_dir": resolved.get("book_dir"), "source_pdf": pdf_use,
@@ -910,14 +1222,33 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, resolved)
 
     def _handle_file_b64(self, data):
+        import base64 as _b64mod
         p = (data.get("path") or "").strip()
         if not p or not Path(p).is_file():
             self._send_error(400, "BAD_EXTRA_JSON", "path must be an existing file", "文件路径不存在（服务端本地路径）", "check path (server-side path)")
             return
-        if Path(p).stat().st_size > 50 * 1024 * 1024:
+        try:
+            _size = Path(p).stat().st_size
+        except OSError as exc:
+            self._send_error(400, "BAD_EXTRA_JSON", "%s: %s" % (type(exc).__name__, exc), "文件读取失败", "check path (server-side path)")
+            return
+        if _size > 50 * 1024 * 1024:
             self._send_error(400, "BAD_EXTRA_JSON", "file too large (>50MB)", "文件超过 50MB 上限", "pick a smaller file")
             return
-        b64 = base64.b64encode(Path(p).read_bytes()).decode("ascii")
+        # P2: chunked streaming read (57*1024 is a multiple of 3, so only the
+        # final chunk carries base64 padding and plain concatenation stays valid).
+        try:
+            _parts = []
+            with open(p, "rb") as _fh:
+                while True:
+                    _ch = _fh.read(57 * 1024)
+                    if not _ch:
+                        break
+                    _parts.append(_b64mod.b64encode(_ch).decode("ascii"))
+        except OSError as exc:
+            self._send_error(500, "UNKNOWN", "%s: %s" % (type(exc).__name__, exc), "文件读取失败", "retry later")
+            return
+        b64 = "".join(_parts)
         self._send(200, {"b64": b64, "bytes": len(b64)})
 
     def _handle_notation(self, data):

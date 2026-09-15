@@ -1466,12 +1466,19 @@ def make_searchable(
     geo_source: str = "auto",
     align_out: str | Path | None = None,
     report: str | Path | None = None,
+    dpi: int = DEFAULT_DPI,
 ) -> Path:
     """Create a raster-backed searchable PDF for selected zero-based pages.
 
     Old calling convention ``make_searchable(pdf, pages, md, boxes_or_none, target)``
-    remains valid.
+    remains valid. ``dpi`` (72..300, default 200) controls the raster resolution.
     """
+    try:
+        dpi = int(dpi)
+    except (TypeError, ValueError):
+        raise ValueError("dpi must be an integer in 72..300")
+    if dpi < 72 or dpi > 300:
+        raise ValueError("dpi must be an integer in 72..300")
     source = Path(pdf_path)
     if out_pdf is None:
         raise ValueError("out_pdf is required")
@@ -1507,7 +1514,7 @@ def make_searchable(
                 source_page = document.load_page(pno)
                 rect = fitz.Rect(source_page.rect)
                 page = output.new_page(width=rect.width, height=rect.height)
-                pixmap = source_page.get_pixmap(dpi=DEFAULT_DPI, alpha=False)
+                pixmap = source_page.get_pixmap(dpi=dpi, alpha=False)
                 png_bytes = pixmap.tobytes("png")
                 page.insert_image(page.rect, stream=png_bytes, overlay=False)
                 text = _page_text(md_dict, pno)

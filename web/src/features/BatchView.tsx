@@ -9,7 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/EmptyState";
 import { useSession } from "@/stores/session";
 import { useLog } from "@/stores/log";
-import { batchDryRun, batchRun, job, jobCancel, jobPages, type DryRunRes, type JobPageItem, type JobProgress } from "@/lib/engine";
+import { batchDryRun, batchRetry, batchRun, job, jobCancel, jobPages, pdfPreviewUrl, type DryRunRes, type JobPageItem, type JobProgress } from "@/lib/engine";
 import { toZh } from "@/lib/errors";
 import { pickFile, pickDir, PDF_FILTER } from "@/lib/pick";
 import { parseExtra } from "@/lib/utils";
@@ -50,6 +50,8 @@ export function BatchView() {
   const [failPages, setFailPages] = useState<JobPageItem[] | null>(null);
   const [failTotal, setFailTotal] = useState(0);
   const [copiedFail, setCopiedFail] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [thumbOk, setThumbOk] = useState(true);
   const timer = useRef<number | null>(null);
   const failCount = useRef(0);
 
@@ -108,6 +110,7 @@ export function BatchView() {
         stopPoll();
         setSummary((j.summary as Record<string, unknown>) ?? null);
         setPhase("done");
+        setRetrying(false);
         const toks = (j.summary as Record<string, unknown> | undefined)?.total_tokens ?? "?";
         const failed = (j.summary as Record<string, unknown> | undefined)?.failed_pages_this_run ?? "?";
         emit(`batch 完成 tokens=${String(toks)} failed=${String(failed)}`, "ok");
@@ -116,15 +119,16 @@ export function BatchView() {
         stopPoll();
         setSummary((j.summary as Record<string, unknown>) ?? null);
         setPhase("cancelled");
+        setRetrying(false);
         emit(`批量已取消：已落盘的不再涨，重跑自动续上`, "warn");
         await loadFailPages(id);
       } else if (j.status === "error") {
         stopPoll();
         setPhase("error");
+        setRetrying(false);
         setError(toZh(j.error ?? j.hint_cn ?? "未知错误"));
         emit(`批量失败：${j.error ?? j.hint_cn ?? "未知错误"}`, "err");
         await loadFailPages(id);
-      } else {
         // running / queued: keep polling. Backoff only applies after transport failures.
         schedule(id, 2000);
       }
@@ -187,6 +191,33 @@ export function BatchView() {
     }
   }
 
+  async function doRetryFailed() {
+    if (!jobId) return;
+    setRetrying(true);
+    setError("");
+    emit("开始：仅重试失败页", "muted");
+    try {
+      const r = await batchRetry(jobId);
+      // Backend may return the same (0 failed) or a new retry job id; poll either way.
+      const nextId = r.job_id || jobId;
+      if (r.retried && r.retried.length > 0) {
+        emit(`后端已建重试任务：${r.retried.length} 页（${r.retried.slice(0, 10).join("、")}${r.retried.length > 10 ? "…" : ""}），job=${nextId}`, "ok");
+      } else {
+        emit(`后端接手重试：job=${nextId}（无失败页则原地复查）`, "ok");
+      }
+      setJobId(nextId);
+      setPhase("running");
+      failCount.current = 0;
+      stopPoll();
+      schedule(nextId, 0);
+    } catch (e) {
+      setRetrying(false);
+      const zh = toZh(e);
+      emit(`仅重试失败页不可用：${e instanceof Error ? e.message : e}`, "err");
+      setError(`${zh}（该后端暂无 /api/batch/retry，请点“开始批量”手动续跑：已成功页会自动跳过）`);
+    }
+  }
+
   async function doCancel() {
     if (!jobId) return;
     setPhase("stopping");
@@ -221,6 +252,8 @@ export function BatchView() {
   const failListVisible =
     (phase === "done" || phase === "cancelled" || phase === "error") && failPages !== null;
   const doneVisible = phase === "done" || phase === "cancelled";
+  // P1: done + has failed pages -> offer failed-only retry (graceful fallback inside doRetryFailed).
+  const retryFailedVisible = phase === "done" && failTotal > 0;
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 p-4">
@@ -232,11 +265,20 @@ export function BatchView() {
         <CardContent className="flex flex-col gap-3">
           <div className="flex items-center gap-2.5">
             <Label htmlFor="batch-pdf">PDF 文件</Label>
-            <Input id="batch-pdf" value={pdf} onChange={(e) => setPdf(e.target.value)} placeholder="服务端可读路径" />
-            <Button variant="outline" size="sm" onClick={async () => { const v = await pickFile(PDF_FILTER); if (v) setPdf(v); }}>
+            <Input id="batch-pdf" value={pdf} onChange={(e) => { setPdf(e.target.value); setThumbOk(true); }} placeholder="服务端可读路径" />
+            <Button variant="outline" size="sm" onClick={async () => { const v = await pickFile(PDF_FILTER); if (v) { setPdf(v); setThumbOk(true); } }}>
               选 PDF…
             </Button>
           </div>
+          {pdf.trim() && thumbOk && (
+            // P1: thumbnail only; a missing /api/pdf/preview hides silently and never blocks OCR.
+            <img
+              src={pdfPreviewUrl(pdf.trim(), start + 1, 120)}
+              alt="PDF 起始页预览"
+              className="max-h-40 self-start rounded-md border object-contain"
+              onError={() => setThumbOk(false)}
+            />
+          )}
           <div className="flex items-center gap-2.5">
             <Label htmlFor="batch-out">输出目录</Label>
             <Input id="batch-out" value={outdir} onChange={(e) => setOutdir(e.target.value)} />
@@ -246,7 +288,7 @@ export function BatchView() {
           </div>
           <div className="flex items-center gap-2.5">
             <Label htmlFor="batch-start">页码范围</Label>
-            <Input id="batch-start" className="w-24" inputMode="numeric" value={String(start)} onChange={(e) => setStart(Number(e.target.value) || 0)} />
+            <Input id="batch-start" className="w-24" inputMode="numeric" value={String(start)} onChange={(e) => { setStart(Math.max(0, Number(e.target.value) || 0)); setThumbOk(true); }} />
             <span className="text-xs text-muted-foreground">到</span>
             <Input id="batch-end" className="w-32" inputMode="numeric" value={endText} onChange={(e) => setEndText(e.target.value)} placeholder="留空=到尾页" />
           </div>
@@ -336,6 +378,11 @@ export function BatchView() {
                     {failPages!.length > 0 && (
                       <Button variant="outline" size="sm" className="ml-2" onClick={copyFailPages}>
                         {copiedFail ? "已复制" : "复制页号"}
+                      </Button>
+                    )}
+                    {retryFailedVisible && (
+                      <Button size="sm" className="ml-2" onClick={doRetryFailed} disabled={retrying || running}>
+                        {retrying ? "重试中…" : `仅重试失败页（${failTotal}）`}
                       </Button>
                     )}
                   </p>

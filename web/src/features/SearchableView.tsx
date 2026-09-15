@@ -6,8 +6,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/EmptyState";
+import { Progress } from "@/components/ui/progress";
 import { useLog } from "@/stores/log";
-import { searchableBuild, job, jobCancel, bookResolve, type BookResolveRes } from "@/lib/engine";
+import { searchableBuild, listJobs, job, jobCancel, bookResolve, type BookResolveRes, type JobListItem } from "@/lib/engine";
 import { toZh } from "@/lib/errors";
 import { pickFile, pickDir, PDF_FILTER } from "@/lib/pick";
 
@@ -28,12 +29,19 @@ export function SearchableView() {
   const [dir, setDir] = useState("");
   const [geo, setGeo] = useState<Geo>("auto");
   const [kw, setKw] = useState("");
+  // P2: searchable render DPI, 72-300, default 150, passed through to build.
+  const [dpiText, setDpiText] = useState("150");
   const [phase, setPhase] = useState<Phase>("idle");
   const [book, setBook] = useState<BookResolveRes | null>(null);
   const [error, setError] = useState("");
   const [jobId, setJobId] = useState("");
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [copied, setCopied] = useState(false);
+  // P2: running progress stage+pct; null-safe (old backend omits them).
+  const [stage, setStage] = useState<string | null>(null);
+  const [pct, setPct] = useState<number | null>(null);
+  // P2: job history; null = unsupported -> hidden.
+  const [jobs, setJobs] = useState<JobListItem[] | null>(null);
   const timer = useRef<number | null>(null);
   const failCount = useRef(0);
 
@@ -46,10 +54,22 @@ export function SearchableView() {
 
   useEffect(() => stopPoll, []);
 
+  // P2: job history, hidden when the backend has no /api/jobs list endpoint.
+  useEffect(() => {
+    let alive = true;
+    void listJobs(20).then((r) => { if (alive) setJobs(r); });
+    return () => { alive = false; };
+  }, []);
+
   async function poll(id: string) {
     try {
       const j = await job(id);
       failCount.current = 0;
+      // P2: running progress stage+pct (both optional; stale values kept when omitted).
+      if (j.progress) {
+        if (typeof j.progress.stage === "string" && j.progress.stage) setStage(j.progress.stage);
+        if (typeof j.progress.pct === "number" && Number.isFinite(j.progress.pct)) setPct(j.progress.pct);
+      }
       if (j.status === "done") {
         stopPoll();
         setResult((j.result as Record<string, unknown>) ?? {});
@@ -57,6 +77,7 @@ export function SearchableView() {
         const warns = ((j.result as Record<string, unknown> | undefined)?.font_warnings as string[] | undefined) ?? [];
         for (const w of warns) emit(w, "warn");
         emit("构建双层 PDF 完成", "ok");
+        void listJobs(20).then((r) => { if (r) setJobs(r); });
       } else if (j.status === "cancelled") {
         stopPoll();
         setResult((j.result as Record<string, unknown> | undefined) ?? null);
@@ -113,12 +134,18 @@ export function SearchableView() {
       emit("请选择有效 OCR 输出目录（含 pages/*.md）", "err");
       return;
     }
+    // P2: DPI 72-300 clamp up front; old backend ignores the extra field harmlessly.
+    const dpiRaw = Number(dpiText) || 150;
+    const dpi = Math.min(300, Math.max(72, Math.round(dpiRaw)));
+    if (String(dpi) !== dpiText.trim()) setDpiText(String(dpi));
     failCount.current = 0;
     setPhase("running");
     setError("");
     setResult(null);
     setCopied(false);
-    emit("开始：构建双层 PDF", "muted");
+    setStage(null);
+    setPct(null);
+    emit(`开始：构建双层 PDF（DPI ${dpi}）`, "muted");
     try {
       // Never build one book's pages onto another book's raster: bind first.
       const bound = await identify(dir.trim(), pdf.trim());
@@ -134,7 +161,7 @@ export function SearchableView() {
         return;
       }
       const kws = kw.replace(/，/g, ",").split(",").map((x) => x.trim()).filter(Boolean);
-      const r = await searchableBuild(pdfUse, dir.trim(), geo, kws);
+      const r = await searchableBuild(pdfUse, dir.trim(), geo, kws, dpi);
       for (const w of r.warnings ?? []) emit(w, "warn");
       setJobId(r.job_id);
       stopPoll();
@@ -234,6 +261,25 @@ export function SearchableView() {
             <Label htmlFor="search-kw">验证关键词</Label>
             <Input id="search-kw" value={kw} onChange={(e) => setKw(e.target.value)} />
           </div>
+          <div className="flex items-center gap-2.5">
+            <Label htmlFor="search-dpi">渲染 DPI</Label>
+            <Input
+              id="search-dpi"
+              className="w-24"
+              inputMode="numeric"
+              value={dpiText}
+              onChange={(e) => {
+                const raw = e.target.value;
+                setDpiText(raw);
+                const n = Number(raw);
+                if (raw.trim() !== "" && Number.isFinite(n) && (n < 72 || n > 300)) {
+                  emit(`DPI 越界，已限制 72-300（当前 ${raw}）`, "warn");
+                }
+              }}
+              placeholder="150"
+            />
+            <span className="text-xs text-muted-foreground">72-300，默认 150，直传给构建</span>
+          </div>
           <p className="text-xs leading-5 text-muted-foreground">双层 PDF 的文字层是看不见的，肉眼没法确认它有没有写进去；这里填的词会被拿到输出 PDF 的文字层里去搜，用来证明文字层确实存在、位置合理。</p>
           <p className="text-xs leading-5 text-muted-foreground">填你确信书里会出现、且分布在不同页的词，多个词用逗号分隔（中英文逗号都行）。纯子串匹配、不分词，所以别填「的」「了」这种满页都有的字，挑有辨识度的词；留空 = 跳过验证，不影响构建。</p>
           <p className="text-xs leading-5 text-muted-foreground">输出目录填批量产出的书文件夹，也就是含 book.json 与 pages/*.md 的那一层；填上级目录时靠各书的 book.json 认出唯一一本，认不出会直接报错而不猜。</p>
@@ -253,14 +299,26 @@ export function SearchableView() {
           <CardTitle>构建结果</CardTitle>
           <CardDescription>输出路径、页数、可复制字数与关键词命中页。</CardDescription>
         </CardHeader>
-        <CardContent>
+        <CardContent className="flex flex-col gap-2">
           {phase === "idle" && (
             <EmptyState icon={BookOpen} tone="idle" title="还没有构建" description="选好原 PDF 与输出目录后点“构建并验证”。" />
           )}
           {phase === "running" && (
             <div className="flex flex-col gap-2" aria-label="构建中">
-              <Skeleton className="h-4 w-1/2" />
-              <Skeleton className="h-4 w-full" />
+              {/* P2: stage+pct when the backend reports them; skeleton otherwise. */}
+              {stage || pct !== null ? (
+                <>
+                  <p className="text-[13px] tabular" role="status">
+                    {stage ? `阶段：${stage}` : "构建中"}{pct !== null ? `（${pct}%）` : ""}
+                  </p>
+                  {pct !== null && <Progress value={pct} max={100} />}
+                </>
+              ) : (
+                <>
+                  <Skeleton className="h-4 w-1/2" />
+                  <Skeleton className="h-4 w-full" />
+                </>
+              )}
             </div>
           )}
           {phase === "cancelled" && (
@@ -321,6 +379,19 @@ export function SearchableView() {
               <div className="mt-2 flex gap-2">
                 <Button variant="outline" size="sm" onClick={copyPath}>{copied ? "已复制" : "复制路径"}</Button>
               </div>
+            </div>
+          )}
+          {/* P2: job history; hidden entirely when the backend has no list endpoint (jobs === null). */}
+          {jobs !== null && jobs.length > 0 && (
+            <div className="flex flex-col gap-1.5" aria-label="历史任务">
+              <p className="text-[13px] text-muted-foreground" role="status">历史任务（近 {jobs.length} 个）</p>
+              <ul className="max-h-40 overflow-y-auto pl-1 text-xs leading-5">
+                {jobs.slice(0, 20).map((h) => (
+                  <li key={h.id} className="break-all font-mono text-muted-foreground">
+                    {h.id}{h.kind ? ` · ${h.kind}` : ""}{h.status ? ` · ${h.status}` : ""}{h.label ? ` · ${h.label}` : ""}
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
         </CardContent>
