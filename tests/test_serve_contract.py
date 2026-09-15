@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import socket
 import subprocess
-import urllib.error
 import sys
+import urllib.error
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -65,7 +66,8 @@ def test_serve_offline_contract():
             assert code == 200 and dry.get("total_pages") == 764
         code, chk = _post(port, "/api/notation/check", {"dir": "out/nonexistent-dir-xyz"})
         assert code == 400
-        code, chk = _post(port, "/api/notation/check", {"dir": "out"})
-        assert code == 200 and chk.get("files") == 0
+        with tempfile.TemporaryDirectory() as tmp:
+            code, chk = _post(port, "/api/notation/check", {"dir": tmp})
+            assert code == 200 and chk.get("files") == 0
     finally:
         proc.terminate()

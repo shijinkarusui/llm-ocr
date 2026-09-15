@@ -563,8 +563,8 @@ def _geometric_gate(
             # anywhere on the page — the old text-only match compared the
             # header copy against the wrong row and reported phantom drift.
             try:
-                ay0 = float(it["y0"]) / 10.0
-                ay1 = float(it["y1"]) / 10.0
+                ay0 = float(it["y0"])
+                ay1 = float(it["y1"])
             except (TypeError, ValueError, KeyError):
                 continue
             if ay1 < ey - 2 * tol or ay0 > ey + 2 * tol:

@@ -15,7 +15,7 @@ def add_llm_args(p: argparse.ArgumentParser, include_concurrency: bool) -> argpa
     if include_concurrency:
         p.add_argument("--concurrency", type=int, default=None, help="1..20 (default 4 CLI / 1 lib; >8 warns, >20 rejects)")
     p.add_argument("--extra-json", type=str, default=None, help='JSON object merged into request body')
-    p.add_argument("--timeout", type=int, default=None, help="POST timeout seconds (default 90; GET fixed 15s)")
+    p.add_argument("--timeout", type=int, default=None, help="POST timeout seconds (default 120; GET fixed 15s)")
     p.add_argument("--system", type=str, default=None, help="System prompt (Anthropic dedicated; chat/responses via extra if needed)")
     return p
 

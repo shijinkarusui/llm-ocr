@@ -66,7 +66,7 @@ def _normalize_punctuation(text: str) -> str:
     quote_open = True
     for index, char in enumerate(text):
         if char in _PUNCT:
-            out.append(_PUNCT[char])
+            out.append(_PUNCT[char] if _near_cjk(text, index) else char)
         elif char == '"':
             out.append(_LEFT_QUOTE if quote_open else _RIGHT_QUOTE)
             quote_open = not quote_open

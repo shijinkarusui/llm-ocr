@@ -47,16 +47,16 @@ from typing import Any
 DEFAULT_BASE_URL = "http://YOUR_GATEWAY_HOST:2113/v1"
 DEFAULT_MODEL = "OC/muse-spark-1.3-contributor-free"
 DEFAULT_ENDPOINT_PATH = "/v1/chat/completions"
-# W0: POST-only timeout default 90s; GET恒15s single-try. TIMEOUT保留为POST别名(向后兼容).
-TIMEOUT = 90
-POST_TIMEOUT = 90
+# W0: POST-only timeout default 120s; GET恒15s single-try. TIMEOUT保留为POST别名(向后兼容).
+TIMEOUT = 120
+POST_TIMEOUT = 120
 GET_TIMEOUT = 15
 # Default output-length ceiling.  Reasoning models (Muse 1.2/1.3) spend
 # thousands of tokens thinking before emitting any text, so a small cap
 # truncates the answer: the Responses API reports status=incomplete with an
-# empty output array.  20000 leaves room for thinking plus a full OCR page.
-MAX_TOKENS = 20000
-MAX_OUTPUT_TOKENS = 20000
+# empty output array.  30000 leaves room for thinking plus a full OCR page.
+MAX_TOKENS = 30000
+MAX_OUTPUT_TOKENS = 30000
 
 # Output-length control is spelled differently per endpoint: chat/completions
 # takes max_tokens (or max_completion_tokens) while the Responses API takes

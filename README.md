@@ -231,7 +231,7 @@ Three API layers, from raw to convenient:
 4. `auto_vision()` — responses single try, falling back to chat single try
    **only** on 429/5xx/timeout/OSError (1+1); 400/401/403/404 raise directly.
 
-Reliability: `HttpError` separates retryable from fail-fast; POST timeout 90 s
+ Reliability: `HttpError` separates retryable from fail-fast; POST timeout 120 s
 (`--timeout`), `GET /v1/models` fixed at 15 s single try; `Retry-After` capped
 at 60 s; `_resolve_endpoint()` prevents `/v1/v1` double-writes and upgrades a
 bare `host:port` to `http://` (with https-443 detection).

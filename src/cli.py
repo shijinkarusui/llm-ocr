@@ -152,11 +152,11 @@ def cmd_ocr(args: argparse.Namespace) -> int:
     if args.image is not None:
         data = Path(args.image).read_bytes()
         text = ocr_image(data, base_url=args.base_url or g.base_url, model=args.model or g.model,
-                         api_key=key or g.key, endpoint=args.endpoint, detail=args.detail or r.detail,
+                         api_key=key or g.key, endpoint=(args.endpoint or r.endpoint), detail=(args.detail or r.detail),
                          system=args.system, extra=_xw)
     else:
         text = ocr_pdf_page(args.pdf, args.page, base_url=args.base_url or g.base_url, model=args.model or g.model,
-                            api_key=key or g.key, endpoint=args.endpoint, detail=args.detail or r.detail,
+                            api_key=key or g.key, endpoint=(args.endpoint or r.endpoint), detail=(args.detail or r.detail),
                             system=args.system, extra=_xw, dpi=args.dpi)
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -196,9 +196,9 @@ def cmd_batch(args: argparse.Namespace) -> int:
         args.pdf, args.output_dir, dpi=args.dpi,
         concurrency=args.concurrency, retries=args.retries, prompt_path=args.prompt,
         start=args.start, end=args.end,
-        base_url=args.base_url, model=args.model, api_key=key,
-        endpoint=args.endpoint, detail=args.detail, system=args.system, extra=extra,
-        timeout=getattr(args, "timeout", None),
+        base_url=(args.base_url or g.base_url), model=(args.model or g.model), api_key=(key or g.key),
+        endpoint=(args.endpoint or r.endpoint), detail=(args.detail or r.detail), system=args.system, extra=extra,
+        timeout=(getattr(args, "timeout", None) if getattr(args, "timeout", None) is not None else g.timeout),
     )
     print(f"batch_complete=true total_tokens={summary.get('total_tokens', 0)} failed={summary.get('failed_pages_this_run', 0)}")
     return 0
@@ -262,7 +262,7 @@ def _config_init(args: argparse.Namespace) -> int:
         from config import write_env  # type: ignore
     import types as _t
     ns = _t.SimpleNamespace(base_url=base_url, model=model, api_key=None, key_stdin=False,
-                            endpoint=endpoint, detail="high", timeout=90, concurrency=concurrency,
+                            endpoint=endpoint, detail="high", timeout=120, concurrency=concurrency,
                             dpi=200, retries=2, system=None, is_cli=True)
     g2, r2 = resolve_config(ns)
     path = write_env(Path(".env"))

@@ -60,7 +60,7 @@ except ImportError:
             base_url: str = "http://YOUR_GATEWAY_HOST:2113/v1"
             model: str = "OC/muse-spark-1.3-contributor-free"
             key: str = ""
-            timeout: int = 90
+            timeout: int = 120
         @_dc
         class _FBRun:
             endpoint: str = "chat"
@@ -338,7 +338,7 @@ def _resolve_run(
             "base_url": base_url, "model": model, "key": api_key or "",
             "requested": endpoint if endpoint is not None else "chat",
             "detail": detail if detail is not None else "high",
-            "timeout": timeout if timeout is not None else 90,
+            "timeout": timeout if timeout is not None else 120,
         }
     ns = _types.SimpleNamespace(
         base_url=base_url, model=model, api_key=api_key, key_stdin=False,
@@ -511,6 +511,7 @@ def _process_one(
                 _extra.setdefault("timeout", timeout)
             ep_norm = ep
             attempt_no = attempt + 1
+            auto_leg = 1
             if ep == "auto":
                 if _auto_fn is None:
                     raise RuntimeError("auto_vision unavailable (llm_client import failed)")
@@ -518,9 +519,9 @@ def _process_one(
                 if isinstance(usage, dict):
                     ep_norm = str(usage.get("_endpoint_normalized", "auto") or "auto")
                     try:
-                        attempt_no = int(usage.get("_leg", 1) or 1)
+                        auto_leg = int(usage.get("_leg") or 1)
                     except (TypeError, ValueError):
-                        attempt_no = 1
+                        auto_leg = 1
             elif ep == "responses":
                 content, usage = responses_vision(png_bytes, prompt, base_url=base_url, model=model, api_key=api_key, detail=detail, **_extra)
             elif ep == "messages":
@@ -563,6 +564,8 @@ def _process_one(
                 "duration_ms": _dur,
                 "http_status": 200,
             }
+            if ep == "auto":
+                record["auto_leg"] = auto_leg
             if extra:
                 record["extra"] = extra
             _append_jsonl(usage_path, record)
@@ -679,8 +682,16 @@ def summarize_usage(
             if isinstance(row, dict):
                 records.append(row)
     latest: dict[Any, dict[str, Any]] = {}
-    for record in records:
-        key = record.get("pno_0based", record.get("page_number"))
+    for idx, record in enumerate(records):
+        if record.get("pno_0based") is not None:
+            key = record.get("pno_0based")
+        elif record.get("page_number") is not None:
+            try:
+                key = int(record.get("page_number")) - 1
+            except (TypeError, ValueError):
+                key = record.get("page_number")
+        else:
+            key = idx
         latest[key] = record  # 后行覆盖先行
     pages = list(latest.values())
     success = [r for r in pages if r.get("status") == "success"]

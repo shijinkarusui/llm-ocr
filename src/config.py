@@ -25,7 +25,7 @@ Priority everywhere is CLI > env > DEFAULT. Full env table:
   endpoint:    ns.endpoint   > LLM_OCR_ENDPOINT  > CLI default "responses" / lib default "chat"
   concurrency: ns.concurrency> LLM_OCR_CONCURRENCY > CLI default 4 / lib default 1
   detail:      ns.detail     > LLM_OCR_DETAIL    > "high"
-  timeout:     ns.timeout    > LLM_OCR_TIMEOUT   > 90 (POST-only; GET is fixed 15s elsewhere)
+  timeout:     ns.timeout    > LLM_OCR_TIMEOUT   > 120 (POST-only; GET is fixed 15s elsewhere)
   dpi/retries: CLI-only, NO env fallback (ns.dpi / ns.retries taken directly).
   LLM_OCR_PORT: deprecated; if set non-empty we warnings.warn and ignore it
     (base_url is the only endpoint knob).
@@ -70,7 +70,7 @@ __all__ = [
 DEFAULT_BASE_URL = "http://YOUR_GATEWAY_HOST:2113/v1"
 DEFAULT_MODEL = "OC/muse-spark-1.3-contributor-free"
 DEFAULT_DETAIL = "high"
-DEFAULT_TIMEOUT = 90
+DEFAULT_TIMEOUT = 120
 DEFAULT_DPI = 200
 DEFAULT_RETRIES = 2
 CLI_DEFAULT_ENDPOINT = "responses"

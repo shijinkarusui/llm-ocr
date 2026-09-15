@@ -189,6 +189,11 @@ def _run_batch_job(jid, pdf_path, outdir, kw, cleanup=None):
         summary = run_batch(pdf_path, outdir, **kw)
         # usage.jsonl lives in the per-book folder, not directly under outdir.
         prog = _progress_from_usage(book_output_dir(pdf_path, outdir))
+        if _job_cancelled(jid):
+            # best-effort cooperative cancel: 当前页跑完才停, engine 层 cooperative cancel 待后续.
+            _job_set(jid, status="cancelled", summary=summary, progress=prog)
+            log("batch job %s cancelled" % jid)
+            return
         _job_set(jid, status="done", summary=summary, progress=prog)
         log("batch job %s done tokens=%s failed=%s" % (
             jid, summary.get("total_tokens", 0), summary.get("failed_pages_this_run", 0)))
@@ -217,6 +222,9 @@ def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords,
         md = {int(p.stem.split("_")[1]): p.read_text(encoding="utf-8") for p in pages}
         with fitz.open(str(pdf_path)) as doc:
             total = doc.page_count
+        missing = [p for p in range(total) if p not in md and str(p) not in md]
+        if missing:
+            raise ValueError("missing Markdown for %d page(s), e.g. %s; resume batch first" % (len(missing), missing[:5]))
         target = root / "book_searchable.pdf"
         align_out = root / "align"
         make_searchable(pdf_path, list(range(total)), md, None, target,
@@ -237,6 +245,11 @@ def _run_searchable_job(jid, pdf_path, pages_dir, out_dir, geo_source, keywords,
                 out["book_json"] = str(book_json_path(book_dir))
             except Exception as exc:  # noqa: BLE001
                 out["book_json_error"] = "%s: %s" % (type(exc).__name__, exc)
+        if _job_cancelled(jid):
+            # best-effort cooperative cancel: 当前页跑完才停, engine 层 cooperative cancel 待后续.
+            _job_set(jid, status="cancelled", result=out)
+            log("searchable job %s cancelled" % jid)
+            return
         _job_set(jid, status="done", result=out)
         log("searchable job %s done pages=%d" % (jid, total))
     except Exception as exc:  # noqa: BLE001
@@ -393,8 +406,15 @@ class Handler(BaseHTTPRequestHandler):
             text, usage = C.auto_vision(png, prompt, **llm, **extra)
         elif endpoint == "responses":
             text, usage = C.responses_vision(png, prompt, **llm, **extra)
-        else:
+        elif endpoint == "chat":
             text, usage = C.chat_vision(png, prompt, **llm, **extra)
+        elif endpoint in ("messages", "anthropic"):
+            import warnings as _warn
+            _warn.warn("messages experimental, no guarantee", UserWarning)
+            text, usage = C.anthropic_vision(png, prompt, **llm, **extra)
+        else:
+            self._send(400, {"error": "unknown endpoint: %s" % endpoint})
+            return
         ms = int((_time.monotonic() - t0) * 1000)
         ep_used = str((usage or {}).get("_endpoint_normalized", endpoint)) if isinstance(usage, dict) else endpoint
         self._send(200, {"endpoint_used": ep_used, "text": text,
@@ -451,11 +471,25 @@ class Handler(BaseHTTPRequestHandler):
             dpi = int(data.get("dpi") or 200)
         except (TypeError, ValueError):
             dpi = 200
-        preview = base64.b64encode(render_page(pdf, pno, 150)).decode("ascii")
-        text = ocr_pdf_page(pdf, pno, base_url=llm["base_url"], model=llm["model"],
-                            api_key=llm["api_key"], endpoint=data.get("endpoint") or "responses",
-                            detail=llm["detail"], extra=extra, dpi=dpi, timeout=data.get("timeout"),
-                            prompt=_request_prompt(data))
+        import fitz as _fitz
+        try:
+            with _fitz.open(str(pdf)) as _doc:
+                _page_count = _doc.page_count
+        except Exception as exc:
+            self._send(400, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
+        if pno < 0 or pno >= _page_count:
+            self._send(400, {"error": "pno out of range 0..%d" % (_page_count - 1)})
+            return
+        try:
+            preview = base64.b64encode(render_page(pdf, pno, 150)).decode("ascii")
+            text = ocr_pdf_page(pdf, pno, base_url=llm["base_url"], model=llm["model"],
+                                api_key=llm["api_key"], endpoint=data.get("endpoint") or "responses",
+                                detail=llm["detail"], extra=extra, dpi=dpi, timeout=data.get("timeout"),
+                                prompt=_request_prompt(data))
+        except (IndexError, ValueError) as exc:
+            self._send(400, {"error": "%s: %s" % (type(exc).__name__, exc)})
+            return
         self._send(200, {"markdown": text, "png_b64_preview": preview})
 
     def _handle_dry_run(self, data):
@@ -544,6 +578,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "目录里没有 pages/*.md：%s" % pages_dir})
             return
         geo = (data.get("geo_source") or "auto").strip()
+        if geo == "external":
+            self._send(400, {"error": "geo_source=external 需要外部 boxes（当前 API 未接 boxes 参数），请用 auto/embedded/fallback_only"})
+            return
         kws = data.get("keywords") or []
         if isinstance(kws, str):
             kws = [k.strip() for k in kws.replace("\uff0c", ",").split(",") if k.strip()]

@@ -233,7 +233,7 @@ llm-ocr/
 4. `auto_vision()` —— responses 单试，仅 429/5xx/timeout/OSError 回退 chat
    单试（1+1）；400/401/403/404 直接抛。
 
-可靠性：`HttpError` 区分可重试与 fail-fast；POST 超时 90s（`--timeout` 可调），
+ 可靠性：`HttpError` 区分可重试与 fail-fast；POST 超时 120s（`--timeout` 可调），
 `GET /v1/models` 固定 15s 单试；`Retry-After` 上限 60s；
 `_resolve_endpoint()` 防 `/v1/v1` 双写，支持 bare host:port 自动补
 `http://` 与 https-443 判定。
