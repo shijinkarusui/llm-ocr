@@ -105,6 +105,13 @@ def _page_text(md_dict: Mapping[Any, Any], pno: int) -> str:
             return _as_text(md_dict[key])
     raise KeyError(f"missing Markdown for page index {pno}")
 
+def _page_raw_md(md_dict: Mapping[Any, Any], pno: int) -> str:
+    for key in (pno, pno + 1, str(pno), str(pno + 1)):
+        if key in md_dict:
+            val = md_dict[key]
+            return str(val) if val is not None else ""
+    return ""
+
 
 def _page_boxes(boxes: Mapping[Any, Any] | None, pno: int) -> list[dict[str, Any]] | None:
     if boxes is None:
@@ -1151,7 +1158,12 @@ def plan_boxed_lines(
                 "equation_region": region,
             })
             continue
-
+        x_center_norm = (x0n + x1n) / 2.0
+        is_equation_block = bool(line.get("is_equation")) or (
+            text.strip().startswith("$$") and text.strip().endswith("$$") and len(text.strip()) >= 4
+        )
+        if is_equation_block:
+            region = (x0n, y0n, x1n, y1n)
         # Split on embedded newlines FIRST (MinerU blocks often carry several
         # logical lines inside one block, e.g. "[i]\n[e]"), then wrap any line
         # that still does not fit after font scaling. This keeps zero-loss
@@ -1163,7 +1175,7 @@ def plan_boxed_lines(
             logical = [text]
         wrapped: list[str] = []
         for raw in logical:
-            if _measured_width(raw, fontsize)[0] > box_width:
+            if not is_equation_block and _measured_width(raw, fontsize)[0] > box_width:
                 wrapped.extend(_wrap_line(raw, fontsize, box_width))
             else:
                 wrapped.append(raw)
@@ -1456,6 +1468,101 @@ def _ink_aligned_lines(
             order += 1
     return lines
 
+def _extract_page_toc(
+    md_text: str,
+    pno_1based: int,
+    page_plan: list[dict[str, Any]] | None = None,
+) -> list[list[Any]]:
+    """Extract Markdown headings and map them to PyMuPDF TOC items [lvl, title, pno_1based, target]."""
+    toc: list[list[Any]] = []
+    if not md_text:
+        return toc
+    for line in md_text.splitlines():
+        stripped = line.strip()
+        m = re.match(r"^(#{1,6})\s+(.+)$", stripped)
+        if not m:
+            continue
+        lvl = len(m.group(1))
+        title = m.group(2).strip()
+        if not title:
+            continue
+        toc.append([lvl, title, pno_1based])
+    return toc
+
+
+def _detect_page_physical_number(
+    md_text: str,
+    page_lines: list[dict[str, Any]] | None = None,
+) -> tuple[str, int] | None:
+    """Detect printed page number from page Markdown or footer geometry lines.
+
+    Returns (style, number) where style is 'D' (decimal) or 'r' (roman).
+    """
+    candidates: list[str] = []
+    if page_lines:
+        for ln in page_lines:
+            if ln.get("mode") == "header_footer_excluded" or ln.get("header_footer"):
+                candidates.append(str(ln.get("text", "")).strip())
+    if md_text:
+        md_lines = [l.strip() for l in md_text.splitlines() if l.strip()]
+        if md_lines:
+            candidates.extend(md_lines[-3:])
+            candidates.append(md_lines[0])
+
+    num_pat = re.compile(r"^[·\.\-—–\s]*(\d{1,4})[·\.\-—–\s]*$")
+    cn_pat = re.compile(r"^第\s*(\d{1,4})\s*页$")
+    roman_pat = re.compile(r"^[·\.\-—–\s]*([ivxlcdm]{1,8})[·\.\-—–\s]*$", re.IGNORECASE)
+
+    for cand in candidates:
+        m = num_pat.match(cand)
+        if m:
+            val = int(m.group(1))
+            if 1 <= val <= 3000:
+                return ("D", val)
+        m = cn_pat.match(cand)
+        if m:
+            val = int(m.group(1))
+            if 1 <= val <= 3000:
+                return ("D", val)
+
+    roman_values = {"i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8, "ix": 9, "x": 10}
+    for cand in candidates:
+        m = roman_pat.match(cand)
+        if m:
+            r_str = m.group(1).lower()
+            if r_str in roman_values:
+                return ("r", roman_values[r_str])
+    return None
+
+
+def _build_page_labels_rules(
+    detected_pages: list[tuple[str, int] | None],
+    total_pages: int,
+) -> list[dict[str, Any]]:
+    """Build PyMuPDF set_page_labels rules from per-page detections."""
+    rules: list[dict[str, Any]] = []
+    current_rule: dict[str, Any] | None = None
+
+    for i in range(total_pages):
+        det = detected_pages[i] if i < len(detected_pages) else None
+        if det:
+            style, num = det[0], det[1]
+            if current_rule is None:
+                current_rule = {"startpage": i, "style": style, "prefix": "", "firstpagenum": num}
+                rules.append(current_rule)
+            else:
+                expected_num = current_rule["firstpagenum"] + (i - current_rule["startpage"])
+                if style != current_rule["style"] or num != expected_num:
+                    current_rule = {"startpage": i, "style": style, "prefix": "", "firstpagenum": num}
+                    rules.append(current_rule)
+        else:
+            if current_rule is None:
+                current_rule = {"startpage": i, "style": "D", "prefix": "", "firstpagenum": 1}
+                rules.append(current_rule)
+
+    return rules or [{"startpage": 0, "style": "D", "prefix": "", "firstpagenum": 1}]
+
+
 
 def make_searchable(
     pdf_path: str | Path,
@@ -1501,6 +1608,8 @@ def make_searchable(
     align_boxes: dict[str, Any] = {}
     align_pages: list[dict[str, Any]] = []
     overflow_global = 0
+    full_toc: list[list[Any]] = []
+    detected_labels: list[tuple[str, int] | None] = []
     try:
         with fitz.open(str(source)) as document:
             # Cross-page repeated header/footer anchors: computed once for the
@@ -1603,6 +1712,25 @@ def make_searchable(
                 page_metrics["reason"] = reason
                 align_boxes[str(pno)] = {"reliable": bool(page_lines), "lines": page_lines}
                 align_pages.append(page_metrics)
+                pno_1based = len(align_pages)
+                raw_md = _page_raw_md(md_dict, pno)
+                page_toc = _extract_page_toc(raw_md, pno_1based, page_lines)
+                if page_toc:
+                    full_toc.extend(page_toc)
+                detected_labels.append(_detect_page_physical_number(text, page_lines))
+        if full_toc:
+            try:
+                output.set_toc(full_toc)
+            except Exception:
+                pass
+        has_page_labels = False
+        try:
+            page_labels = _build_page_labels_rules(detected_labels, len(pages))
+            if page_labels:
+                output.set_page_labels(page_labels)
+                has_page_labels = True
+        except Exception:
+            pass
         target.parent.mkdir(parents=True, exist_ok=True)
         output.save(str(target), garbage=4, deflate=True)
     finally:
@@ -1612,17 +1740,23 @@ def make_searchable(
         ap = Path(align_out)
         ap.mkdir(parents=True, exist_ok=True)
         (ap / "boxes.json").write_text(json.dumps(align_boxes, ensure_ascii=False, indent=2), encoding="utf-8")
-        (ap / "align_report.json").write_text(json.dumps(_build_align_report(align_pages), ensure_ascii=False, indent=2), encoding="utf-8")
+        (ap / "align_report.json").write_text(json.dumps(_build_align_report(align_pages, toc_count=len(full_toc), has_page_labels=has_page_labels), ensure_ascii=False, indent=2), encoding="utf-8")
     if report:
         Path(report).parent.mkdir(parents=True, exist_ok=True)
-        Path(report).write_text(json.dumps(_build_align_report(align_pages), ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(report).write_text(json.dumps(_build_align_report(align_pages, toc_count=len(full_toc), has_page_labels=has_page_labels), ensure_ascii=False, indent=2), encoding="utf-8")
     return target
 
 
-def _build_align_report(pages_metrics: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_align_report(
+    pages_metrics: list[dict[str, Any]],
+    toc_count: int = 0,
+    has_page_labels: bool = False,
+) -> dict[str, Any]:
     return {
         "schema": "align_report_v2",
         "pages": pages_metrics,
+        "toc_count": int(toc_count),
+        "has_page_labels": bool(has_page_labels),
         "constants": {
             "SIMILARITY_THRESHOLD": SIMILARITY_THRESHOLD,
             "MIN_FONT_PT": MIN_FONT_PT,
