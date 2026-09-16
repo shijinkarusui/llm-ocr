@@ -393,6 +393,13 @@ covers that case.
 
 ## 10. Changelog
 
+### 0.7.0 — dual-layer PDF evolution & full-pipeline experience upgrade
+
+- **Automatic bookmark outline (TOC Tree) generation for dual-layer PDFs.** Extracts section headers (`#` to `######`) from OCR markdown outputs and injects a complete hierarchical outline tree into the searchable PDF.
+- **Logical page numbers & Page Labels mapping.** Intelligently detects physical folio numbers on pages and compiles page label rules (`set_page_labels`), ensuring the PDF viewer navigation folio matches the actual printed book pages.
+- **Equation & atomic block topology protection.** Blocks math and formula blocks (`$$...$$`, `is_equation`) from being wrapped or split across characters, preserving atomic bounding and preventing distorted text alignments.
+- **Robust multi-hundred-page processing.** Hardened geometry gates, punctuation normalization, and batch error tolerance for large books, with rich progress and telemetry feedback across the desktop UI.
+
 ### 0.6.3 — per-book output folders, identity binding, portable releases
 
 - **Each book gets its own folder.** Batch output now lands in
