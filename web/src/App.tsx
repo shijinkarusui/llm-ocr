@@ -14,21 +14,27 @@ import "./index.css";
 
 const queryClient = new QueryClient();
 
-function View() {
+function Views() {
   const view = useSession((s) => s.view);
-  switch (view) {
-    case "single":
-      return <SingleView />;
-    case "batch":
-      return <BatchView />;
-    case "searchable":
-      return <SearchableView />;
-    case "params":
-      return <ParamsView />;
-    case "connect":
-    default:
-      return <ConnectView />;
-  }
+  return (
+    <>
+      <div className={view === "connect" ? "block" : "hidden"}>
+        <ConnectView />
+      </div>
+      <div className={view === "single" ? "block" : "hidden"}>
+        <SingleView />
+      </div>
+      <div className={view === "batch" ? "block" : "hidden"}>
+        <BatchView />
+      </div>
+      <div className={view === "searchable" ? "block" : "hidden"}>
+        <SearchableView />
+      </div>
+      <div className={view === "params" ? "block" : "hidden"}>
+        <ParamsView />
+      </div>
+    </>
+  );
 }
 
 function App() {
@@ -57,7 +63,7 @@ function App() {
         <div className="flex min-h-0 flex-1">
           <Sidebar />
           <main className="min-w-0 flex-1 overflow-y-auto" aria-label="主内容">
-            <View />
+            <Views />
           </main>
         </div>
         <LogConsole />

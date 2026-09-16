@@ -9,7 +9,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/EmptyState";
 import { useSession } from "@/stores/session";
 import { useLog } from "@/stores/log";
-import { batchDryRun, batchRetry, batchRun, job, jobCancel, jobPages, pdfPreviewUrl, type DryRunRes, type JobPageItem, type JobProgress } from "@/lib/engine";
+import { batchDryRun, batchRetry, batchRun, job, jobCancel, jobPages, listJobs, pdfPreviewUrl, type DryRunRes, type JobPageItem, type JobProgress } from "@/lib/engine";
 import { toZh } from "@/lib/errors";
 import { pickFile, pickDir, PDF_FILTER } from "@/lib/pick";
 import { parseExtra } from "@/lib/utils";
@@ -67,7 +67,30 @@ export function BatchView() {
     timer.current = window.setTimeout(() => poll(id), delayMs);
   }
 
-  useEffect(() => stopPoll, []);
+  useEffect(() => {
+    let unmounted = false;
+    void (async () => {
+      try {
+        const jobs = await listJobs(10);
+        if (unmounted || !jobs) return;
+        const activeBatch = jobs.find(
+          (item) => item.kind === "batch" && (item.status === "running" || item.status === "queued"),
+        );
+        if (activeBatch) {
+          setJobId(activeBatch.id);
+          setPhase("running");
+          emit(`已连接后台运行中的批量任务（job=${activeBatch.id}）`, "ok");
+          schedule(activeBatch.id, 0);
+        }
+      } catch {
+        /* 静默跳过 */
+      }
+    })();
+    return () => {
+      unmounted = true;
+      stopPoll();
+    };
+  }, []);
 
   async function doDry() {
     if (!pdf.trim()) {
@@ -129,7 +152,9 @@ export function BatchView() {
         setError(toZh(j.error ?? j.hint_cn ?? "未知错误"));
         emit(`批量失败：${j.error ?? j.hint_cn ?? "未知错误"}`, "err");
         await loadFailPages(id);
-        // running / queued: keep polling. Backoff only applies after transport failures.
+      } else {
+        // running / queued: keep polling every 2s
+        setPhase("running");
         schedule(id, 2000);
       }
     } catch (e) {
