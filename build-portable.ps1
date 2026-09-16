@@ -258,17 +258,18 @@ if ($SkipSmoke) {
 # 5. Assemble the portable folder
 # ---------------------------------------------------------------------------
 Write-Step "5/6 assemble: $Stage"
-if (Test-Path -LiteralPath $Stage) {
-    Remove-Item -LiteralPath $Stage -Recurse -Force
+$PackStage = Join-Path $OutRoot "tmp-pack\$Name"
+if (Test-Path -LiteralPath (Join-Path $OutRoot "tmp-pack")) {
+    Remove-Item -LiteralPath (Join-Path $OutRoot "tmp-pack") -Recurse -Force
 }
-New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+New-Item -ItemType Directory -Path $PackStage -Force | Out-Null
 
 # The frontend is compiled into the exe (frontendDist ../dist), so nothing else
 # from web/ belongs in the folder.
-Copy-Item -LiteralPath $AppExe      -Destination (Join-Path $Stage 'llm-ocr.exe')   -Force
-Copy-Item -LiteralPath $SidecarExe  -Destination (Join-Path $Stage 'serve.exe')     -Force
-Copy-Item -LiteralPath $SidecarInternal -Destination (Join-Path $Stage '_internal') -Recurse -Force
-
+Copy-Item -LiteralPath $AppExe      -Destination (Join-Path $PackStage 'llm-ocr.exe')   -Force
+Copy-Item -LiteralPath $SidecarExe  -Destination (Join-Path $PackStage 'serve.exe')     -Force
+Copy-Item -LiteralPath $SidecarInternal -Destination (Join-Path $PackStage '_internal') -Recurse -Force
+$Stage = $PackStage
 # Post-assembly invariants, checked on the staged copy rather than on the inputs.
 Assert-Path (Join-Path $Stage 'llm-ocr.exe') 'staged llm-ocr.exe'
 Assert-Path (Join-Path $Stage 'serve.exe') 'staged serve.exe'
@@ -325,6 +326,26 @@ if ($SkipZip) {
     Write-Host ("  zip         : {0:N0} bytes ({1} MB)" -f $item.Length, [math]::Round($item.Length / 1MB, 2))
     Write-Host ("  sha256      : $hash")
 }
+    $TargetFolder = Join-Path $OutRoot $Name
+    if (-not (Test-Path -LiteralPath $TargetFolder)) {
+        New-Item -ItemType Directory -Path $TargetFolder -Force | Out-Null
+    }
+    # Sync staged files to destination, gracefully skipping in-use binaries if locked
+    Get-ChildItem -LiteralPath $PackStage -Recurse | ForEach-Object {
+        $rel = $_.FullName.Substring($PackStage.Length).TrimStart('\', '/')
+        $dest = Join-Path $TargetFolder $rel
+        if ($_.PSIsContainer) {
+            if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+        } else {
+            try {
+                Copy-Item -LiteralPath $_.FullName -Destination $dest -Force -ErrorAction Stop
+            } catch {
+                Write-Warning "File $rel is in use by running instance; skipped in folder (zip has the newest copy)."
+            }
+        }
+    }
+    $Stage = $TargetFolder
+    Remove-Item -LiteralPath (Join-Path $OutRoot "tmp-pack") -Recurse -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
 # Report: no installer artifacts may appear
