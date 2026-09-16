@@ -20,3 +20,7 @@ web/src-tauri/WixTools/
 *.exe
 *.msi
 .serve-*.lock
+
+# local run logs/scripts (never commit)
+Temp/
+
