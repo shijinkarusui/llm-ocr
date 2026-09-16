@@ -8,6 +8,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/EmptyState";
 import { Progress } from "@/components/ui/progress";
 import { useLog } from "@/stores/log";
+import { useSession } from "@/stores/session";
 import { searchableBuild, listJobs, job, jobCancel, bookResolve, type BookResolveRes, type JobListItem } from "@/lib/engine";
 import { toZh } from "@/lib/errors";
 import { pickFile, pickDir, PDF_FILTER } from "@/lib/pick";
@@ -24,10 +25,11 @@ function fmtBytes(n: unknown): string {
 }
 
 export function SearchableView() {
-  const emit = useLog((s) => s.emit);
-  const [pdf, setPdf] = useState("");
-  const [dir, setDir] = useState("");
-  const [geo, setGeo] = useState<Geo>("auto");
+  const s = useSession();
+  const emit = useLog((l) => l.emit);
+  const [pdf, setPdf] = useState(s.searchablePdf || "");
+  const [dir, setDir] = useState(s.searchableOutdir || "out/book_gui");
+  const [geo, setGeo] = useState<Geo>(s.searchableGeoSource || "auto");
   const [kw, setKw] = useState("");
   // P2: searchable render DPI, 72-300, default 150, passed through to build.
   const [dpiText, setDpiText] = useState("150");
@@ -203,15 +205,15 @@ export function SearchableView() {
         <CardContent className="flex flex-col gap-3">
           <div className="flex items-center gap-2.5">
             <Label htmlFor="search-pdf">原 PDF</Label>
-            <Input id="search-pdf" value={pdf} onChange={(e) => setPdf(e.target.value)} placeholder="服务端可读路径" />
-            <Button variant="outline" size="sm" onClick={async () => { const v = await pickFile(PDF_FILTER); if (v) setPdf(v); }}>
+            <Input id="search-pdf" value={pdf} onChange={(e) => { const v = e.target.value; setPdf(v); s.set({ searchablePdf: v }); }} placeholder="服务端可读路径" />
+            <Button variant="outline" size="sm" onClick={async () => { const v = await pickFile(PDF_FILTER); if (v) { setPdf(v); s.set({ searchablePdf: v }); } }}>
               选原 PDF…
             </Button>
           </div>
           <div className="flex items-center gap-2.5">
             <Label htmlFor="search-dir">OCR 输出目录</Label>
-            <Input id="search-dir" value={dir} onChange={(e) => setDir(e.target.value)} placeholder="书文件夹（含 book.json 与 pages/）" />
-            <Button variant="outline" size="sm" onClick={async () => { const v = await pickDir(); if (v) { setDir(v); await identify(v, pdf.trim()); } }}>
+            <Input id="search-dir" value={dir} onChange={(e) => { const v = e.target.value; setDir(v); s.set({ searchableOutdir: v }); }} placeholder="书文件夹（含 book.json 与 pages/）" />
+            <Button variant="outline" size="sm" onClick={async () => { const v = await pickDir(); if (v) { setDir(v); s.set({ searchableOutdir: v }); await identify(v, pdf.trim()); } }}>
               选目录…
             </Button>
           </div>

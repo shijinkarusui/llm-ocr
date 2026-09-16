@@ -37,10 +37,10 @@ function fmtElapsed(ms?: number): string {
 export function BatchView() {
   const s = useSession();
   const emit = useLog((x) => x.emit);
-  const [pdf, setPdf] = useState("");
-  const [outdir, setOutdir] = useState("out/book_gui");
-  const [start, setStart] = useState(0);
-  const [endText, setEndText] = useState("");
+  const [pdf, setPdf] = useState(s.batchPdf || "");
+  const [outdir, setOutdir] = useState(s.batchOutdir || "out/book_gui");
+  const [start, setStart] = useState(s.batchStart ?? 0);
+  const [endText, setEndText] = useState(s.batchEndText || "");
   const [phase, setPhase] = useState<Phase>("idle");
   const [dry, setDry] = useState<DryRunRes | null>(null);
   const [error, setError] = useState("");
@@ -290,8 +290,8 @@ export function BatchView() {
         <CardContent className="flex flex-col gap-3">
           <div className="flex items-center gap-2.5">
             <Label htmlFor="batch-pdf">PDF 文件</Label>
-            <Input id="batch-pdf" value={pdf} onChange={(e) => { setPdf(e.target.value); setThumbOk(true); }} placeholder="服务端可读路径" />
-            <Button variant="outline" size="sm" onClick={async () => { const v = await pickFile(PDF_FILTER); if (v) { setPdf(v); setThumbOk(true); } }}>
+            <Input id="batch-pdf" value={pdf} onChange={(e) => { const v = e.target.value; setPdf(v); s.set({ batchPdf: v }); setThumbOk(true); }} placeholder="服务端可读路径" />
+            <Button variant="outline" size="sm" onClick={async () => { const v = await pickFile(PDF_FILTER); if (v) { setPdf(v); s.set({ batchPdf: v }); setThumbOk(true); } }}>
               选 PDF…
             </Button>
           </div>
@@ -306,16 +306,16 @@ export function BatchView() {
           )}
           <div className="flex items-center gap-2.5">
             <Label htmlFor="batch-out">输出目录</Label>
-            <Input id="batch-out" value={outdir} onChange={(e) => setOutdir(e.target.value)} />
-            <Button variant="outline" size="sm" onClick={async () => { const v = await pickDir(); if (v) setOutdir(v); }}>
+            <Input id="batch-out" value={outdir} onChange={(e) => { const v = e.target.value; setOutdir(v); s.set({ batchOutdir: v }); }} />
+            <Button variant="outline" size="sm" onClick={async () => { const v = await pickDir(); if (v) { setOutdir(v); s.set({ batchOutdir: v }); } }}>
               选目录…
             </Button>
           </div>
           <div className="flex items-center gap-2.5">
             <Label htmlFor="batch-start">页码范围</Label>
-            <Input id="batch-start" className="w-24" inputMode="numeric" value={String(start)} onChange={(e) => { setStart(Math.max(0, Number(e.target.value) || 0)); setThumbOk(true); }} />
+            <Input id="batch-start" className="w-24" inputMode="numeric" value={String(start)} onChange={(e) => { const v = Math.max(0, Number(e.target.value) || 0); setStart(v); s.set({ batchStart: v }); setThumbOk(true); }} />
             <span className="text-xs text-muted-foreground">到</span>
-            <Input id="batch-end" className="w-32" inputMode="numeric" value={endText} onChange={(e) => setEndText(e.target.value)} placeholder="留空=到尾页" />
+            <Input id="batch-end" className="w-32" inputMode="numeric" value={endText} onChange={(e) => { const v = e.target.value; setEndText(v); s.set({ batchEndText: v }); }} placeholder="留空=到尾页" />
           </div>
           {dry && (
             <p className="text-[13px] tabular" role="status">
