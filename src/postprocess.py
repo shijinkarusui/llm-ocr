@@ -128,8 +128,7 @@ def merge_pages(pages: Mapping[int, str], title: str = "\u8bed\u97f3\u5b66\u6559
             raise TypeError("page markdown must be str")
         normalized[pno] = md
     numbers = sorted(normalized)
-    index = "\n".join(f"- Page {pno}: PAGE {pno}" for pno in numbers)
-    chunks = [f"# {title}", "", "## Page Index", index, ""]
+    chunks = [f"# {title}", ""]
     for pno in numbers:
         chunks.extend([f"<!-- PAGE {pno} -->", _page_body(normalized[pno]), ""])
     return "\n".join(chunks).rstrip() + "\n"
