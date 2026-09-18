@@ -402,6 +402,12 @@ covers that case.
 
 ## 10. Changelog
 
+### 0.8.0 — integrated Markdown cleaning & release hardening
+
+- **Built-in Markdown cleaning pipeline.** Single-page OCR, batch page writes, and whole-book merging now share an in-project cleaner, so runtime behavior no longer depends on an external knowledge-base script.
+- **Stable whole-book output.** Merged books use fixed page blocks, preserve protected Markdown/LaTeX/table content, remove legacy page indexes and placeholders, and never fabricate missing pages.
+- **Safer persistence and packaging.** Empty or failed cleaned OCR is not written to disk; the packaged sidecar includes the cleaner and has been smoke-tested through the health and book-resolution APIs.
+
 ### 0.7.0 — dual-layer PDF evolution & full-pipeline experience upgrade
 
 - **Automatic bookmark outline (TOC Tree) generation for dual-layer PDFs.** Extracts section headers (`#` to `######`) from OCR markdown outputs and injects a complete hierarchical outline tree into the searchable PDF.
