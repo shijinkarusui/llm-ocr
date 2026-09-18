@@ -93,7 +93,7 @@
             |                     |          | + per-line spread)   |
  +----------v---------+ +---------v--------+ +-----------v---------+
  | check_notation.py  | | postprocess.py   | | verify_searchable.py|
- | GATE: banned       | | clean_md (CJK    | | VERIFY: per-page    |
+| GATE: banned       | | page/book cleaner | | VERIFY: per-page    |
  | ascii/lost marks/  | | punct, footers,  | | keyword hits,       |
  | no LaTeX residue   | | protect math) +  | | copyable chars,     |
  | -> 0 issues gate   | | merge_pages +    | | compare_md diff     |
@@ -134,7 +134,8 @@ PDF page --render.py(200dpi)--> PNG bytes
   --> check_notation.py gate (0 issues)
   --> <output dir>/<pdf stem>/pages/page_NNNN.md
       (+ usage.jsonl row: endpoint/extra/tokens)
-  --> postprocess.clean_md + merge_pages (end of batch)
+  --> markdown_cleaner.clean_single_page (single-page exit / before batch write)
+  --> markdown_cleaner.clean_merged_book + merge_pages (end of batch)
       --> <output dir>/<pdf stem>/<pdf stem>-ocr.md
   --> make_searchable(raster + md [+boxes]) --> book_searchable.pdf
   --> verify_searchable(keywords) --> hits / copyable chars
@@ -268,23 +269,31 @@ bare `host:port` to `http://` (with https-443 detection).
    unknown fields survive, `updated` and `pages_done` refresh); credential-shaped
    keys and values are stripped on every read *and* write.
 
-   The merge is not a plain concatenation — `merge_pages` runs `clean_md` per
-   page, so CJK punctuation normalization happens there too. It always merges
-   *what exists on disk*, not just this run's page range, so segmented reruns
-   keep growing the same `<pdf stem>-ocr.md`.
+   The merge is not a plain concatenation: single-page exits and batch writes first
+   run `clean_single_page`; `merge_pages` cleans each existing page again, then
+   `clean_merged_book` normalizes the whole-book page blocks. It never invents
+   missing pages; empty pages keep only their canonical boundaries.
 4. **Notation gate** (`check_notation.py`): the machine form of
    `prompts/notation_spec.md` — rejects ASCII substitutes like `[t_w]`/`[tw]`/
    `[kh]`, LaTeX residue (`\underset`/`\overset`/`$` delimiters), split or
    stray combining marks, unbalanced brackets. Target: 0 issues.
-5. **Post-process** (`postprocess.py`): source is ASCII-only, Chinese
-   punctuation is built from escaped code points; page footers `· n ·` become
-   their own line; code fences and LaTeX are protected then restored;
-   `merge_pages(pages, title)` turns a `{page number: markdown}` mapping into
-   `# <title>` + `## Page Index` + one `<!-- PAGE n -->` block per page (pages
-   are re-cleaned through `clean_md`, empty pages become `[EMPTY PAGE]`);
-   `batch_plan.run_batch` calls it at the end of every batch, with the PDF stem
-   as `title`, writing `<output dir>/<pdf stem>/<pdf stem>-ocr.md`;
-   `polish_with_llm` passes through the same three protocols.
+5. **Post-process** (`markdown_cleaner.py` + `postprocess.py`): CJK punctuation, footers,
+   code fences, LaTeX/formulas, IPA, and combining marks are protected before cleanup;
+   local-image replacement never enters protected regions. `merge_pages(pages, title)`
+   merges only pages that exist on disk and emits fixed page blocks:
+   ```markdown
+   ---
+   第 X 页
+
+   page body
+
+   ---
+   ```
+   It emits no page index and never invents missing-page or empty-page placeholder text;
+   legacy HTML page markers are converted to the same format. `batch_plan.run_batch`
+   calls it at the end of every batch, with the PDF stem as `title`, writing
+   `<output dir>/<pdf stem>/<pdf stem>-ocr.md`; `polish_with_llm` passes through the
+   same three protocols.
 6. **Dual layer** (`make_searchable.py`): the page raster is the full-page
    background (size unchanged, `maxdiff=0`, no recompression); when boxes are
    reliable (`reliable != false`) it writes them exactly with

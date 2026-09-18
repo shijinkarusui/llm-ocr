@@ -40,8 +40,10 @@ except ImportError:
 
 try:
     from .postprocess import merge_pages
+    from .markdown_cleaner import clean_single_page
 except ImportError:
     from postprocess import merge_pages  # type: ignore
+    from markdown_cleaner import clean_single_page  # type: ignore
 
 try:
     from .book_id import book_json_path, page_numbers, pdf_page_count, update_book
@@ -144,10 +146,11 @@ def merge_book_markdown(
 ) -> Path | None:
     """Merge existing page files into `<book_root>/<pdf stem>-ocr.md`.
 
-    Reuses `postprocess.merge_pages` (which runs `clean_md` per page), so the book
-    file gets the `# <title>` / `## Page Index` / `<!-- PAGE n -->` structure and
-    CJK punctuation normalization for free. Returns None when no page file exists
-    (no empty book file is written).
+    Reuses `postprocess.merge_pages`, which performs page-local cleaning before
+    sorting and whole-book cleanup after concatenation. The output uses the
+    canonical page blocks and intentionally contains no Page Index or invented
+    missing-page placeholders. Returns None when no page file exists (no empty
+    book file is written).
     """
     root = Path(book_root)
     source = Path(pages_dir) if pages_dir is not None else root / "pages"
@@ -551,7 +554,10 @@ def _process_one(
                 raise ValueError("empty OCR output (blank page or model refusal); retry or rotate")
             prompt_tokens, completion_tokens, total_tokens = _usage_counts(usage if isinstance(usage, dict) else {})
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(content.rstrip() + "\n", encoding="utf-8")
+            cleaned_content = clean_single_page(content or "")
+            if not cleaned_content.strip():
+                raise ValueError("empty cleaned OCR output")
+            output.write_text(cleaned_content.rstrip() + "\n", encoding="utf-8")
             _dur = int((time.monotonic() - _t0) * 1000)
             record = {
                 "schema_version": SCHEMA_VERSION,

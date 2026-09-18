@@ -7,131 +7,20 @@ from collections import Counter
 from pathlib import Path
 from typing import Mapping
 
-# Source stays ASCII-only; Unicode punctuation is built from escaped code points.
-_PUNCT = {
-    ",": "\uff0c",
-    ".": "\u3002",
-    ";": "\uff1b",
-    ":": "\uff1a",
-    "(": "\uff08",
-    ")": "\uff09",
-}
-_LEFT_QUOTE = "\u201c"
-_RIGHT_QUOTE = "\u201d"
-_LEFT_APOS = "\u2018"
-_RIGHT_APOS = "\u2019"
-_FOOTER_RE = re.compile(r"^[ \t]*[\u00b7.]\s*\d+\s*[\u00b7.][ \t]*$")
-_CODE_RE = re.compile(r"(```[\s\S]*?```|`[^`\n]*`)")
-_LATEX_RE = re.compile(
-    r"(?<!\\)(?:\\\[[^\]]*\\\]|\\\([^)]*\\\)|\$[^\$\n]*\$|"
-    r"\\(?:underset|overset|text|mathrm|mathbf|mathit|frac|sqrt)\s*"
-    r"(?:\{(?:[^{}]|\{[^{}]*\})*\}|[^\s]+)(?:\s*\{(?:[^{}]|\{[^{}]*\})*\})?|"
-    r"\^\{(?:[^{}]|\{[^{}]*\})*\}|_\{(?:[^{}]|\{[^{}]*\})*\})"
-)
-_PLACEHOLDER = "\ue000POSTPROCESS%d\ue001"
+try:
+    from .markdown_cleaner import _CODE_RE, _LATEX_RE, clean_md, merge_page_documents
+except ImportError:
+    from markdown_cleaner import _CODE_RE, _LATEX_RE, clean_md, merge_page_documents  # type: ignore
 
 
-def _protect(text: str) -> tuple[str, list[str]]:
-    saved: list[str] = []
 
-    def repl(match: re.Match[str]) -> str:
-        saved.append(match.group(0))
-        return _PLACEHOLDER % (len(saved) - 1)
+def merge_pages(pages: Mapping[int, str], title: str = "语音学教程") -> str:
+    """Return a titled Markdown book with canonical page separators.
 
-    # Footers, code, and math are restored byte-for-byte after punctuation work.
-    protected = re.sub(r"(?m)^[ \t]*[\u00b7.]\s*\d+\s*[\u00b7.][ \t]*$", repl, text)
-    protected = _CODE_RE.sub(repl, protected)
-    protected = _LATEX_RE.sub(repl, protected)
-    return protected, saved
-
-
-def _restore(text: str, saved: list[str]) -> str:
-    for index, value in enumerate(saved):
-        text = text.replace(_PLACEHOLDER % index, value)
-    return text
-
-
-def _is_cjk(char: str) -> bool:
-    return bool(char) and "\u3400" <= char <= "\u9fff"
-
-
-def _near_cjk(text: str, index: int) -> bool:
-    before = text[index - 1] if index else ""
-    after = text[index + 1] if index + 1 < len(text) else ""
-    return _is_cjk(before) or _is_cjk(after)
-
-
-def _normalize_punctuation(text: str) -> str:
-    out: list[str] = []
-    quote_open = True
-    for index, char in enumerate(text):
-        if char in _PUNCT:
-            out.append(_PUNCT[char] if _near_cjk(text, index) else char)
-        elif char == '"':
-            out.append(_LEFT_QUOTE if quote_open else _RIGHT_QUOTE)
-            quote_open = not quote_open
-        elif char == "'":
-            before = text[index - 1] if index else ""
-            after = text[index + 1] if index + 1 < len(text) else ""
-            if before.isalnum() and after.isalnum():
-                out.append(_RIGHT_APOS)
-            else:
-                out.append(_LEFT_APOS if quote_open else _RIGHT_QUOTE)
-                quote_open = not quote_open
-        else:
-            out.append(char)
-    return "".join(out)
-
-
-def _normalize_lines(text: str) -> str:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    result: list[str] = []
-    blank_pending = False
-    for raw in text.split("\n"):
-        line = raw.rstrip()
-        stripped = line.strip()
-        if not stripped:
-            blank_pending = True
-            continue
-        if blank_pending and result:
-            result.append("")
-        blank_pending = False
-        result.append(stripped if _FOOTER_RE.fullmatch(line) else line)
-    while result and not result[-1]:
-        result.pop()
-    return "\n".join(result)
-
-
-def clean_md(text: str) -> str:
-    """Normalize Chinese punctuation and blank lines without changing IPA or LaTeX."""
-    if not isinstance(text, str):
-        raise TypeError("text must be str")
-    protected, saved = _protect(text)
-    cleaned = _normalize_punctuation(protected)
-    return _normalize_lines(_restore(cleaned, saved))
-
-
-def _page_body(md: str) -> str:
-    body = clean_md(md)
-    return body if body else "[EMPTY PAGE]"
-
-
-def merge_pages(pages: Mapping[int, str], title: str = "\u8bed\u97f3\u5b66\u6559\u7a0b") -> str:
-    """Return a titled, indexed Markdown book with explicit page markers."""
-    if not hasattr(pages, "items"):
-        raise TypeError("pages must be a mapping")
-    normalized: dict[int, str] = {}
-    for pno, md in pages.items():
-        if isinstance(pno, bool) or not isinstance(pno, int) or pno < 1:
-            raise ValueError("page numbers must be positive integers")
-        if not isinstance(md, str):
-            raise TypeError("page markdown must be str")
-        normalized[pno] = md
-    numbers = sorted(normalized)
-    chunks = [f"# {title}", ""]
-    for pno in numbers:
-        chunks.extend([f"<!-- PAGE {pno} -->", _page_body(normalized[pno]), ""])
-    return "\n".join(chunks).rstrip() + "\n"
+    Page files are cleaned before merging and the complete result is cleaned
+    again. Missing page numbers are intentionally left missing.
+    """
+    return merge_page_documents(pages, title=title)
 
 
 def _ipa_signature(text: str) -> Counter[str]:
@@ -153,6 +42,7 @@ def _protected_tokens(text: str) -> tuple[list[str], list[str]]:
         )
     ]
     return code_math, footers
+
 
 
 def polish_with_llm(

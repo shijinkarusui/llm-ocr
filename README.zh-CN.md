@@ -11,9 +11,9 @@
 
 ## 0. 项目定位
 
-- **输入**：扫描图片 / 扫描版 PDF（逐页栅格化为 PNG）。
 - **产物 A**：高保真 Markdown —— 整本 `book.md` + 逐页 `pages/page_*.md`
-  （中文标点归一、IPA 原样保留、附加符号以 Unicode 组合记号输出）。
+  （写盘前执行保守的单页 Markdown 清洗；合并完成后再执行整书清洗；中文标点归一、
+  IPA 原样保留、附加符号以 Unicode 组合记号输出）。
 - **产物 B**：双层可搜索 PDF `book_searchable.pdf` —— 原始光栅作背景
   （页面尺寸不变），叠加一层不可见的可搜索文字层。扫描书自带的乱码文字层
   **一律不复用**。
@@ -82,7 +82,7 @@
             |                     |          +-----------v---------+
  +----------v---------+ +---------v--------+ +-----------v---------+
  | check_notation.py  | | postprocess.py   | | verify_searchable.py|
- | 门禁：禁 ASCII 替代 | | clean_md +       | | 关键词命中/可复制字数 |
+ | 门禁：禁 ASCII 替代 | | page/book cleaner | | 关键词命中/可复制字数 |
  | 禁 LaTeX 残留       | | merge_pages +    | | compare_md 比对      |
  | 禁游离组合附加符     | | polish_with_llm  | |                     |
  +--------------------+ +------------------+ +---------------------+
@@ -113,7 +113,8 @@ PDF 页 --render.py(200dpi)--> PNG bytes
   --> check_notation.py 门禁（目标 0 issues）
   --> <输出目录>/<PDF 文件名去扩展名>/pages/page_NNNN.md
       （+ usage.jsonl 记 endpoint/extra/tokens）
-  --> postprocess.clean_md + merge_pages（批量结束时）
+  --> markdown_cleaner.clean_single_page（单页出口/批量写盘前）
+  --> markdown_cleaner.clean_merged_book + merge_pages（批量结束时）
       --> <输出目录>/<PDF 文件名去扩展名>/<同名>-ocr.md
   --> make_searchable(光栅 + md [+boxes]) --> book_searchable.pdf
   --> verify_searchable(keywords) --> 命中页 / 可复制字数
@@ -187,7 +188,7 @@ llm-ocr/
     batch_plan.py       # 批量（线程池/自适应并发/dry-run/usage.jsonl/整本合并）
     render.py           # PyMuPDF 按页渲染 PNG（默认 200dpi）
     make_searchable.py  # 双层 PDF（光栅背景 + 隐藏文字层）
-    postprocess.py      # clean_md（中文标点/页脚/公式保护）+ merge_pages
+    postprocess.py      # merge_pages 兼容入口；清洗逻辑在 markdown_cleaner.py
     book_id.py          # book.json 身份文件：写入/读取/按源 PDF 认书（无凭据）
     check_notation.py   # 标号门禁（禁 ASCII 替代、LaTeX 残留、未配对括号）
     verify_searchable.py# 成品验证（关键词命中页/可复制字数/compare_md）
@@ -265,19 +266,26 @@ llm-ocr/
    而不是猜。同一本书重复跑是**幂等更新**（`created` 与自定义字段保留，
    `updated` / `pages_done` 刷新）；键名或值一旦长得像凭据，读写两侧都会被剔除。
 
-   合并**不是纯拼接**：`merge_pages` 内部对每页再跑一次 `clean_md`，中文标点
-   归一就在这一步做；空页写成 `[EMPTY PAGE]`。合并对象是**磁盘上实际存在的
-   全部页文件**（不只是本次页码范围），所以分段跑多次会自然累积成整本。
+  合并**不是纯拼接**：单页出口与批量写盘前先执行 `clean_single_page`，合并时
+  `merge_pages` 对实际存在的每页再次清洗，最后由 `clean_merged_book` 统一页块格式。
+  不补缺页；空页只保留标准页边界，不写入占位文本。
 4. **标号门禁**（`check_notation.py`）：`prompts/notation_spec.md` 的机器化身 —
    禁 `[t_w]`/`[tw]`/`[kh]` 类 ASCII 替代、禁 LaTeX 残留、禁拆分或游离的
    组合附加符、未配对括号。门禁目标 0 issues。
-5. **后处理**（`postprocess.py`）：源码 ASCII-only，中文标点由转义码点构造；
-   页脚 `· n ·` 单独成行；代码围栏与 LaTeX 先保护后恢复；
-   `merge_pages(pages, title)` 把 `{页码: markdown}` 变成 `# <title>` +
-   `## Page Index` + 每页一段 `<!-- PAGE n -->`（每页再走一遍 `clean_md`，
-   空页写 `[EMPTY PAGE]`）；`batch_plan.run_batch` 在每次批量结束时以 PDF
-   文件名去扩展名为 `title` 调用它，写出
-   `<输出目录>/<书名>/<书名>-ocr.md`。
+5. **后处理**（`markdown_cleaner.py` + `postprocess.py`）：中文标点、页脚、代码围栏、
+  LaTeX/公式、IPA 和组合附加符号会先保护再清洗；本地图片替换不会进入保护区。
+  `merge_pages(pages, title)` 只合并磁盘上实际存在的页，并输出固定页块：
+  ```markdown
+  ---
+  第 X 页
+
+  正文内容
+
+  ---
+  ```
+  不生成页码索引，也不自动补缺页或写入空页占位；旧的 HTML 页标会转换为上述格式。
+  `batch_plan.run_batch` 在批量结束时以 PDF 文件名去扩展名为 `title` 调用它，写出
+  `<输出目录>/<书名>/<书名>-ocr.md`。
 6. **双层**（`make_searchable.py`）：原页光栅做全页背景（尺寸不变，
    `maxdiff=0` 无二次压缩）；boxes 可靠（`reliable≠false`）走
    `render_mode=3` 按盒精确写入，否则 fallback 双副本

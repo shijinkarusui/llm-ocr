@@ -24,7 +24,7 @@ a = Analysis(
     ],
     hiddenimports=[
         'llm_client', 'batch_plan', 'book_id', 'ocr_page', 'config', 'check_notation',
-        'postprocess', 'make_searchable', 'verify_searchable', 'render',
+        'postprocess', 'markdown_cleaner', 'make_searchable', 'verify_searchable', 'render',
         'geom_extract', 'geom_align',
     ],
     hookspath=[], hooksconfig={}, runtime_hooks=[],

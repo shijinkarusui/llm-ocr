@@ -60,6 +60,11 @@ try:
     import fitz
 except ImportError as exc:
     raise RuntimeError("render_page requires PyMuPDF (import name fitz)") from exc
+try:
+    from .markdown_cleaner import clean_single_page
+except ImportError:
+    from markdown_cleaner import clean_single_page  # type: ignore
+
 
 ROOT: Final = pathlib.Path(__file__).resolve().parents[1]
 PROMPT_PATH: Final = ROOT / "prompts" / "ocr_system.md"
@@ -191,17 +196,17 @@ def ocr_image(
         if _av is None:
             raise RuntimeError("auto_vision unavailable (llm_client import failed)")
         content, _usage = _av(png_bytes, prompt, base_url=base_url, model=model, api_key=api_key, detail=detail, **extra)  # type: ignore
-        return content
+        return clean_single_page(content or "")
     if ep == "chat":
         content, _usage = chat_vision(png_bytes, prompt, base_url=base_url, model=model, api_key=api_key, detail=detail, **extra)
-        return content
+        return clean_single_page(content or "")
     if ep == "responses":
         # responses uses instructions for system-like prompt; keep ocr_system as input prompt
         content, _usage = responses_vision(png_bytes, prompt, base_url=base_url, model=model, api_key=api_key, detail=detail, **extra)
-        return content
+        return clean_single_page(content or "")
     if ep == "messages":
         content, _usage = anthropic_vision(png_bytes, prompt, base_url=base_url, model=model, api_key=api_key, system=system, **extra)
-        return content
+        return clean_single_page(content or "")
     raise ValueError(f"unknown endpoint: {endpoint} (expected chat|responses|messages|auto)")
 
 
@@ -230,16 +235,16 @@ def ocr_image_url(
         if _av is None:
             raise RuntimeError("auto_vision unavailable (llm_client import failed)")
         content, _usage = _av(image_url, prompt, base_url=base_url, model=model, api_key=api_key, detail=detail, **extra)  # type: ignore
-        return content
+        return clean_single_page(content or "")
     if ep == "chat":
         content, _usage = chat_vision_url(image_url, prompt, base_url=base_url, model=model, api_key=api_key, detail=detail, **extra)
-        return content
+        return clean_single_page(content or "")
     if ep == "responses":
         content, _usage = responses_vision_url(image_url, prompt, base_url=base_url, model=model, api_key=api_key, detail=detail, **extra)
-        return content
+        return clean_single_page(content or "")
     if ep == "messages":
         content, _usage = anthropic_vision_url(image_url, prompt, base_url=base_url, model=model, api_key=api_key, system=system, **extra)
-        return content
+        return clean_single_page(content or "")
     raise ValueError(f"unknown endpoint: {endpoint}")
 
 
